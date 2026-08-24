@@ -17,8 +17,9 @@ Choose download type:
   1) MP4 video  - best Mac/iPhone compatibility
   2) MKV video  - absolute best available quality
   3) MP3 audio
+  4) Subtitles   - SRT captions (official or auto-generated)
 
-Type [1-3]: 1
+Type [1-4]: 1
 
 Choose video quality:
   1) Best available
@@ -104,3 +105,9 @@ Type:
 Quality:
 1) Best available
 ```
+
+To download subtitles without the video, choose option 4. Enter a YouTube
+language code such as `en`, `fr`, or `es`, or press Enter to use English. The
+script prefers creator-provided captions and can also download YouTube's
+auto-generated captions. The subtitle file is saved as `.srt` in the same
+`~/Downloads/YouTube/` folder.

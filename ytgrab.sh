@@ -56,13 +56,14 @@ echo "Choose download type:"
 echo "  1) MP4 video  - best Mac/iPhone compatibility"
 echo "  2) MKV video  - absolute best available quality"
 echo "  3) MP3 audio"
+echo "  4) Subtitles   - SRT captions (official or auto-generated)"
 echo
 
 while true; do
-  read -r -p "Type [1-3]: " TYPE
+  read -r -p "Type [1-4]: " TYPE
   case "$TYPE" in
-    1|2|3) break ;;
-    *) echo "Please choose 1, 2, or 3." ;;
+    1|2|3|4) break ;;
+    *) echo "Please choose 1, 2, 3, or 4." ;;
   esac
 done
 
@@ -134,7 +135,7 @@ if [ "$TYPE" = "1" ] || [ "$TYPE" = "2" ]; then
   fi
 
 # ---------- Audio ----------
-else
+elif [ "$TYPE" = "3" ]; then
   echo
   echo "Choose MP3 quality:"
   echo "  1) High   (320 kbps)"
@@ -166,6 +167,31 @@ else
     -x \
     --audio-format mp3 \
     --audio-quality "$AUDIO_QUALITY" \
+    "$URL"
+
+# ---------- Subtitles ----------
+else
+  echo
+  echo "Enter a subtitle language code."
+  echo "Examples: en (English), fr (French), es (Spanish), or all"
+  read -r -p "Language [en]: " SUBTITLE_LANGUAGE
+  SUBTITLE_LANGUAGE="${SUBTITLE_LANGUAGE:-en}"
+
+  echo
+  echo "Download type : SRT subtitles"
+  echo "Language      : $SUBTITLE_LANGUAGE"
+  echo "Save folder   : $OUTDIR"
+  echo
+
+  # Download creator-provided captions when available and automatic captions
+  # otherwise, then convert the selected subtitle track(s) to SRT.
+  yt-dlp "${COMMON_ARGS[@]}" \
+    --skip-download \
+    --write-subs \
+    --write-auto-subs \
+    --sub-langs "$SUBTITLE_LANGUAGE" \
+    --sub-format "srt/best" \
+    --convert-subs srt \
     "$URL"
 fi
 
