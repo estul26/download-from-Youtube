@@ -258,8 +258,14 @@ font_is_installed() {
   if [ "$family" = "Songti SC" ]; then
     [ -f "/System/Library/Fonts/Supplemental/Songti.ttc" ] && return 0
   fi
-  if [ "$family" = "Geeza Pro" ]; then
-    [ -f "/System/Library/Fonts/GeezaPro.ttc" ] && return 0
+  if [ "$family" = "UKIJ Tuz Tom" ]; then
+    for font_file in \
+      "$HOME/Library/Fonts/UKIJTuT.ttf" \
+      /Library/Fonts/UKIJTuT.ttf \
+      /System/Library/Fonts/UKIJTuT.ttf \
+      /System/Library/Fonts/Supplemental/UKIJTuT.ttf; do
+      [ -f "$font_file" ] && return 0
+    done
   fi
   if [ "$family" = "Noto Sans" ]; then
     for font_file in \
@@ -307,9 +313,10 @@ check_dual_dependencies() {
     echo "  brew install --cask font-noto-sans"
     return 1
   fi
-  if ! font_is_installed "Geeza Pro"; then
-    echo "The macOS font 'Geeza Pro' could not be found."
-    echo "It is required to render Uyghur's Arabic script correctly."
+  if ! font_is_installed "UKIJ Tuz Tom"; then
+    echo "The font 'UKIJ Tuz Tom' could not be found."
+    echo "Install UKIJ Tuz Tom (UKIJTuT.ttf) with Font Book, then try again."
+    echo "Download it from: https://ukij.org/fonts/"
     return 1
   fi
 }
@@ -648,7 +655,7 @@ normalize_subtitle() {
   fi
 
   # ASS files can carry inline font tags into SRT. Remove only those tags so
-  # the selected Songti/Noto family, size, and colors are applied consistently.
+  # the selected subtitle family, size, and colors are applied consistently.
   if ! sed -E 's#</?[Ff][Oo][Nn][Tt][^>]*>##g' "$converted" > "$cleaned"; then
     rm -f -- "$converted" "$cleaned"
     return 1
@@ -858,8 +865,8 @@ subtitle_font_names() {
   SUBTITLE_FONT2="Noto Sans"
   [ "$LANG1_IS_SIMPLIFIED" -eq 1 ] && SUBTITLE_FONT1="Songti SC"
   [ "$LANG2_IS_SIMPLIFIED" -eq 1 ] && SUBTITLE_FONT2="Songti SC"
-  [ "$LANG1_IS_UYGHUR" -eq 1 ] && SUBTITLE_FONT1="Geeza Pro"
-  [ "$LANG2_IS_UYGHUR" -eq 1 ] && SUBTITLE_FONT2="Geeza Pro"
+  [ "$LANG1_IS_UYGHUR" -eq 1 ] && SUBTITLE_FONT1="UKIJ Tuz Tom"
+  [ "$LANG2_IS_UYGHUR" -eq 1 ] && SUBTITLE_FONT2="UKIJ Tuz Tom"
 }
 
 build_combined_subtitle_ass() {

@@ -41,18 +41,22 @@ Options 1 through 4 require:
 brew install yt-dlp ffmpeg
 ```
 
-Option 5 also requires FFmpeg's subtitle-rendering libraries and Noto Sans:
+Option 5 also requires FFmpeg's subtitle-rendering libraries, Noto Sans, and
+[UKIJ Tuz Tom](https://ukij.org/fonts/):
 
 ```bash
 brew install ffmpeg-full
 brew install --cask font-noto-sans
 ```
 
+Download UKIJ Tuz Tom from the linked font page, then open `UKIJTuT.ttf` in
+Font Book and choose **Install**.
+
 `ffmpeg-full` is a keg-only Homebrew formula. The script locates it directly,
 so you do not need to change your shell's `PATH`. It verifies the
 `subtitles`/libass filter, `ffprobe`, Apple VideoToolbox encoding, Songti SC,
-Noto Sans, and the built-in macOS Geeza Pro font before starting option 5. It
-never installs software by itself.
+Noto Sans, and UKIJ Tuz Tom before starting option 5. It never installs
+software by itself.
 
 Update the tools later with:
 
@@ -151,9 +155,9 @@ captions from that language from being stacked on screen at once.
 
 ### Fonts and Chinese characters
 
-Simplified Chinese uses the macOS `Songti SC` family. Uyghur uses the built-in
-macOS `Geeza Pro Bold` face for joined right-to-left Arabic-script text.
-English, Turkish, and other custom languages use Noto Sans.
+Simplified Chinese uses the macOS `Songti SC` family. Uyghur uses the
+user-installed `UKIJ Tuz Tom` family for joined right-to-left Arabic-script
+text. English, Turkish, and other custom languages use Noto Sans.
 
 `Songti TC` may display Chinese successfully when you select that font for a
 switchable subtitle track in IINA. This tool intentionally uses `Songti SC`
