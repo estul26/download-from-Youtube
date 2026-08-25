@@ -148,6 +148,66 @@ class SubtitleImproverTests(unittest.TestCase):
             check=False,
         )
 
+    def run_translate_cli(
+        self,
+        reference_path: Path,
+        output_path: Path,
+        port: int,
+        chunk_size: int = 60,
+    ) -> subprocess.CompletedProcess[str]:
+        environment = os.environ.copy()
+        environment.update(
+            {
+                "OPENAI_API_KEY": "test-key",
+                "OPENAI_API_URL": f"http://127.0.0.1:{port}/v1/responses",
+            }
+        )
+        return subprocess.run(
+            [
+                sys.executable,
+                str(REPOSITORY_ROOT / "subtitle_improver.py"),
+                "--mode",
+                "translate",
+                "--reference",
+                str(reference_path),
+                "--output",
+                str(output_path),
+                "--language",
+                "Turkish (tr)",
+                "--model",
+                "test-model",
+                "--chunk-size",
+                str(chunk_size),
+            ],
+            cwd=REPOSITORY_ROOT,
+            env=environment,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+
+    def run_bash_program(
+        self,
+        program: str,
+        environment_updates: dict[str, str | None] | None = None,
+        input_text: str | None = None,
+    ) -> subprocess.CompletedProcess[str]:
+        environment = os.environ.copy()
+        for key, value in (environment_updates or {}).items():
+            if value is None:
+                environment.pop(key, None)
+            else:
+                environment[key] = value
+        return subprocess.run(
+            ["bash", "-c", program],
+            cwd=REPOSITORY_ROOT,
+            env=environment,
+            input=input_text,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+
     def test_parse_srt_accepts_different_reference_and_target_cue_counts(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             directory = Path(temporary_directory)
@@ -239,6 +299,75 @@ class SubtitleImproverTests(unittest.TestCase):
                 [cue["id"] for cue in document["editable_target_cues"]],
                 [0, 1],
             )
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=2)
+
+    def test_translate_mode_uses_reference_as_timing_template(self) -> None:
+        server = ThreadingHTTPServer(("127.0.0.1", 0), MockResponsesHandler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            with tempfile.TemporaryDirectory() as temporary_directory:
+                directory = Path(temporary_directory)
+                reference_path = directory / "english.srt"
+                output_path = directory / "translated.srt"
+                reference_path.write_text(ENGLISH_SRT, encoding="utf-8")
+
+                completed = self.run_translate_cli(
+                    reference_path,
+                    output_path,
+                    server.server_address[1],
+                    chunk_size=2,
+                )
+
+                self.assertEqual(completed.returncode, 0, completed.stderr)
+                before = improver.parse_srt(reference_path)
+                after = improver.parse_srt(output_path)
+                self.assertEqual(
+                    [(cue.number, cue.timing_line) for cue in after],
+                    [(cue.number, cue.timing_line) for cue in before],
+                )
+                self.assertEqual(
+                    [cue.text for cue in after],
+                    ["改进的字幕 1", "改进的字幕 2"],
+                )
+
+            self.assertEqual(len(MockResponsesHandler.requests), 1)
+            payload = MockResponsesHandler.requests[0]["payload"]
+            document = json.loads(payload["input"])
+            self.assertEqual(document["operation"], "translate")
+            self.assertEqual(document["target_language"], "Turkish (tr)")
+            self.assertEqual(payload["text"]["format"]["name"], "translated_subtitle_cues")
+            self.assertIn("Translate every editable English subtitle cue", payload["instructions"])
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=2)
+
+    def test_translate_mode_preserves_blank_source_cues(self) -> None:
+        MockResponsesHandler.echo_target_text = True
+        server = ThreadingHTTPServer(("127.0.0.1", 0), MockResponsesHandler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            with tempfile.TemporaryDirectory() as temporary_directory:
+                directory = Path(temporary_directory)
+                reference_path = directory / "english-with-blank.srt"
+                output_path = directory / "translated.srt"
+                reference_path.write_text(TARGET_WITH_BLANK_CUE, encoding="utf-8")
+
+                completed = self.run_translate_cli(
+                    reference_path,
+                    output_path,
+                    server.server_address[1],
+                )
+
+                self.assertEqual(completed.returncode, 0, completed.stderr)
+                translated = improver.parse_srt(output_path)
+                self.assertEqual(translated[1].text, "")
+                self.assertEqual(translated[1].timing_line, "00:00:02,000 --> 00:00:03,000")
         finally:
             server.shutdown()
             server.server_close()
@@ -482,8 +611,11 @@ TRACK1_CODE="en"
 TRACK2_CODE="zh-Hans"
 LANG1_LABEL="English"
 LANG2_LABEL="Simplified Chinese"
-ask_yes_no() { return 0; }
+ASK_COUNT=0
+ask_yes_no() { ASK_COUNT=$((ASK_COUNT + 1)); return 0; }
+configure_openai_for_selected_pair
 maybe_improve_subtitle_with_openai
+[ "$ASK_COUNT" -eq 1 ]
 '''
                 completed = subprocess.run(
                     ["bash", "-c", bash_program],
@@ -512,6 +644,300 @@ maybe_improve_subtitle_with_openai
             server.shutdown()
             server.server_close()
             thread.join(timeout=2)
+
+    def test_openai_opt_in_defaults_to_no_even_when_environment_key_exists(self) -> None:
+        secret = "sk-default-no-secret"
+        completed = self.run_bash_program(
+            r'''
+source "$TEST_REPOSITORY_ROOT/ytgrab.sh"
+configure_openai_subtitle_use "translate" "Turkish"
+[ "$OPENAI_SUBTITLE_ENABLED" -eq 0 ]
+[ -z "$OPENAI_RUNTIME_API_KEY" ]
+''',
+            {
+                "OPENAI_API_KEY": secret,
+                "TEST_REPOSITORY_ROOT": str(REPOSITORY_ROOT),
+            },
+            input_text="\n",
+        )
+
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertNotIn(secret, completed.stdout)
+        self.assertNotIn(secret, completed.stderr)
+
+    def test_openai_opt_in_uses_environment_key_without_printing_it(self) -> None:
+        secret = "sk-environment-secret"
+        completed = self.run_bash_program(
+            r'''
+source "$TEST_REPOSITORY_ROOT/ytgrab.sh"
+ask_yes_no() { return 0; }
+configure_openai_subtitle_use "improve" "Uyghur"
+[ "$OPENAI_SUBTITLE_ENABLED" -eq 1 ]
+[ "$OPENAI_RUNTIME_API_KEY" = "$OPENAI_API_KEY" ]
+''',
+            {
+                "OPENAI_API_KEY": secret,
+                "TEST_REPOSITORY_ROOT": str(REPOSITORY_ROOT),
+            },
+        )
+
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertNotIn(secret, completed.stdout)
+        self.assertNotIn(secret, completed.stderr)
+
+    def test_openai_opt_in_reads_missing_key_without_echoing_it(self) -> None:
+        secret = "sk-hidden-runtime-secret"
+        completed = self.run_bash_program(
+            r'''
+source "$TEST_REPOSITORY_ROOT/ytgrab.sh"
+ask_yes_no() { return 0; }
+configure_openai_subtitle_use "translate" "Turkish"
+[ "$OPENAI_SUBTITLE_ENABLED" -eq 1 ]
+[ "$OPENAI_RUNTIME_API_KEY" = "$EXPECTED_KEY" ]
+''',
+            {
+                "EXPECTED_KEY": secret,
+                "OPENAI_API_KEY": None,
+                "TEST_REPOSITORY_ROOT": str(REPOSITORY_ROOT),
+            },
+            input_text=secret + "\n",
+        )
+
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertNotIn(secret, completed.stdout)
+        self.assertNotIn(secret, completed.stderr)
+
+    def test_blank_runtime_key_cancels_openai(self) -> None:
+        completed = self.run_bash_program(
+            r'''
+source "$TEST_REPOSITORY_ROOT/ytgrab.sh"
+ask_yes_no() { return 0; }
+configure_openai_subtitle_use "translate" "Turkish"
+[ "$OPENAI_SUBTITLE_ENABLED" -eq 0 ]
+[ -z "$OPENAI_RUNTIME_API_KEY" ]
+''',
+            {
+                "OPENAI_API_KEY": None,
+                "TEST_REPOSITORY_ROOT": str(REPOSITORY_ROOT),
+            },
+            input_text="\n",
+        )
+
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertIn("No API key was entered", completed.stdout)
+
+    def test_option4_english_and_all_bypass_openai_prompt(self) -> None:
+        for language in ("en", "en-US", "en_US", "all", "fr,es"):
+            with self.subTest(language=language), tempfile.TemporaryDirectory() as temporary_directory:
+                directory = Path(temporary_directory)
+                marker = directory / "direct-language.txt"
+                prompt_marker = directory / "openai-prompted"
+                completed = self.run_bash_program(
+                    r'''
+source "$TEST_REPOSITORY_ROOT/ytgrab.sh"
+check_standard_dependencies() { return 0; }
+prompt_url() { URL="https://example.invalid/video"; }
+ask_yes_no() { : > "$PROMPT_MARKER"; return 1; }
+download_youtube_subtitles_direct() { printf '%s' "$1" > "$DIRECT_MARKER"; }
+run_subtitle_download
+''',
+                    {
+                        "DIRECT_MARKER": str(marker),
+                        "PROMPT_MARKER": str(prompt_marker),
+                        "TEST_REPOSITORY_ROOT": str(REPOSITORY_ROOT),
+                    },
+                    input_text=language + "\n",
+                )
+
+                self.assertEqual(completed.returncode, 0, completed.stderr)
+                self.assertEqual(marker.read_text(encoding="utf-8"), language)
+                self.assertFalse(prompt_marker.exists())
+
+    def test_option4_offers_direct_target_download_after_translation_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            directory = Path(temporary_directory)
+            marker = directory / "fallback-language.txt"
+            completed = self.run_bash_program(
+                r'''
+source "$TEST_REPOSITORY_ROOT/ytgrab.sh"
+prompt_url() { URL="https://example.invalid/video"; }
+ask_yes_no() { return 0; }
+translate_youtube_subtitles_with_openai() { return 1; }
+download_youtube_subtitles_direct() { printf '%s' "$1" > "$FALLBACK_MARKER"; }
+run_subtitle_download
+''',
+                {
+                    "FALLBACK_MARKER": str(marker),
+                    "OPENAI_API_KEY": "test-key",
+                    "TEST_REPOSITORY_ROOT": str(REPOSITORY_ROOT),
+                },
+                input_text="tr\n",
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            self.assertEqual(marker.read_text(encoding="utf-8"), "tr")
+
+    def test_option4_prefers_creator_english_then_falls_back_to_automatic(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            directory = Path(temporary_directory)
+            output_directory = directory / "output"
+            work_directory = output_directory / "ytgrab-subtitle-work.test"
+            calls_path = directory / "calls.txt"
+            output_directory.mkdir()
+            work_directory.mkdir()
+            completed = self.run_bash_program(
+                r'''
+source "$TEST_REPOSITORY_ROOT/ytgrab.sh"
+OUTDIR="$TEST_OUTPUT_DIRECTORY"
+URL="https://example.invalid/video"
+yt-dlp() {
+  case " $* " in
+    *" --write-auto-subs "*)
+      echo "automatic" >> "$TEST_CALLS_PATH"
+      cp -- "$TEST_ENGLISH_FIXTURE" "$TEST_WORK_DIRECTORY/Fixture Video [abc123].en.srt"
+      ;;
+    *" --write-subs "*) echo "creator" >> "$TEST_CALLS_PATH" ;;
+  esac
+  return 0
+}
+download_english_subtitle_for_translation "$TEST_WORK_DIRECTORY"
+[ "$ENGLISH_SUBTITLE_FILE" = "$TEST_WORK_DIRECTORY/Fixture Video [abc123].en.srt" ]
+''',
+                {
+                    "TEST_CALLS_PATH": str(calls_path),
+                    "TEST_ENGLISH_FIXTURE": str(FIXTURE_DIRECTORY / "english.srt"),
+                    "TEST_OUTPUT_DIRECTORY": str(output_directory),
+                    "TEST_REPOSITORY_ROOT": str(REPOSITORY_ROOT),
+                    "TEST_WORK_DIRECTORY": str(work_directory),
+                },
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            self.assertEqual(
+                calls_path.read_text(encoding="utf-8").splitlines(),
+                ["creator", "automatic"],
+            )
+
+    def test_option4_translation_keeps_source_and_uses_collision_safe_names(self) -> None:
+        server = ThreadingHTTPServer(("127.0.0.1", 0), MockResponsesHandler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            with tempfile.TemporaryDirectory() as temporary_directory:
+                directory = Path(temporary_directory)
+                output_directory = directory / "output"
+                output_directory.mkdir()
+                existing_source = output_directory / "Fixture Video [abc123].en.srt"
+                existing_translation = (
+                    output_directory / "Fixture Video [abc123] [OpenAI-translated-tr].srt"
+                )
+                existing_source.write_text("existing source", encoding="utf-8")
+                existing_translation.write_text("existing translation", encoding="utf-8")
+
+                completed = self.run_bash_program(
+                    r'''
+source "$TEST_REPOSITORY_ROOT/ytgrab.sh"
+OUTDIR="$TEST_OUTPUT_DIRECTORY"
+URL="https://example.invalid/video"
+OPENAI_SUBTITLE_ENABLED=1
+OPENAI_RUNTIME_API_KEY="test-key"
+download_english_subtitle_for_translation() {
+  local workdir="$1"
+  ENGLISH_SUBTITLE_FILE="$workdir/Fixture Video [abc123].en.srt"
+  cp -- "$TEST_ENGLISH_FIXTURE" "$ENGLISH_SUBTITLE_FILE"
+}
+translate_youtube_subtitles_with_openai "tr"
+''',
+                    {
+                        "OPENAI_API_KEY": None,
+                        "OPENAI_API_URL": (
+                            f"http://127.0.0.1:{server.server_address[1]}/v1/responses"
+                        ),
+                        "OPENAI_SUBTITLE_MODEL": "test-model",
+                        "TEST_ENGLISH_FIXTURE": str(FIXTURE_DIRECTORY / "english.srt"),
+                        "TEST_OUTPUT_DIRECTORY": str(output_directory),
+                        "TEST_REPOSITORY_ROOT": str(REPOSITORY_ROOT),
+                    },
+                )
+
+                self.assertEqual(completed.returncode, 0, completed.stderr)
+                new_source = output_directory / "Fixture Video [abc123].en (2).srt"
+                new_translation = (
+                    output_directory / "Fixture Video [abc123] [OpenAI-translated-tr] (2).srt"
+                )
+                self.assertTrue(new_source.exists())
+                self.assertTrue(new_translation.exists())
+                translated = improver.parse_srt(new_translation)
+                self.assertEqual(
+                    [cue.text for cue in translated],
+                    ["改进的字幕 1", "改进的字幕 2"],
+                )
+                self.assertEqual(existing_source.read_text(encoding="utf-8"), "existing source")
+                self.assertEqual(
+                    existing_translation.read_text(encoding="utf-8"),
+                    "existing translation",
+                )
+                self.assertNotIn("test-key", completed.stdout)
+                self.assertNotIn("test-key", completed.stderr)
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=2)
+
+    def test_declining_option5_openai_prompt_makes_no_api_request(self) -> None:
+        completed = self.run_bash_program(
+            r'''
+source "$TEST_REPOSITORY_ROOT/ytgrab.sh"
+TRACK1_CODE="en"
+TRACK2_CODE="tr"
+LANG1_LABEL="English"
+LANG2_LABEL="Turkish"
+ASK_COUNT=0
+ask_yes_no() { ASK_COUNT=$((ASK_COUNT + 1)); return 1; }
+configure_openai_for_selected_pair
+maybe_improve_subtitle_with_openai
+[ "$ASK_COUNT" -eq 1 ]
+[ "$OPENAI_SUBTITLE_ENABLED" -eq 0 ]
+''',
+            {
+                "OPENAI_API_KEY": "unused-test-key",
+                "TEST_REPOSITORY_ROOT": str(REPOSITORY_ROOT),
+            },
+        )
+
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertEqual(MockResponsesHandler.requests, [])
+
+    def test_checkpoint_signatures_are_isolated_by_mode(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            directory = Path(temporary_directory)
+            reference_path = directory / "english.srt"
+            target_path = directory / "target.srt"
+            reference_path.write_text(ENGLISH_SRT, encoding="utf-8")
+            target_path.write_text(TARGET_SRT, encoding="utf-8")
+
+            improve_signature = improver.checkpoint_signature(
+                reference_path,
+                target_path,
+                "Turkish (tr)",
+                "improve",
+                "test-model",
+                60,
+                3,
+            )
+            translate_signature = improver.checkpoint_signature(
+                reference_path,
+                target_path,
+                "Turkish (tr)",
+                "translate",
+                "test-model",
+                60,
+                3,
+            )
+
+            self.assertNotEqual(improve_signature, translate_signature)
+            self.assertEqual(improve_signature["mode"], "improve")
+            self.assertEqual(translate_signature["mode"], "translate")
 
     def test_validate_improvements_tolerates_missing_and_extra_cues(self) -> None:
         report = improver.validate_improvements(
@@ -601,6 +1027,37 @@ maybe_improve_subtitle_with_openai
 
             self.assertEqual(completed.returncode, 2)
             self.assertIn("OPENAI_API_KEY is not set", completed.stderr)
+            self.assertFalse(output_path.exists())
+
+    def test_improve_mode_still_requires_target_argument(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            directory = Path(temporary_directory)
+            reference_path = directory / "english.srt"
+            output_path = directory / "improved.srt"
+            reference_path.write_text(ENGLISH_SRT, encoding="utf-8")
+            environment = os.environ.copy()
+            environment["OPENAI_API_KEY"] = "unused-test-key"
+
+            completed = subprocess.run(
+                [
+                    sys.executable,
+                    str(REPOSITORY_ROOT / "subtitle_improver.py"),
+                    "--reference",
+                    str(reference_path),
+                    "--output",
+                    str(output_path),
+                    "--language",
+                    "Turkish (tr)",
+                ],
+                cwd=REPOSITORY_ROOT,
+                env=environment,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+
+            self.assertEqual(completed.returncode, 2)
+            self.assertIn("--target is required in improve mode", completed.stderr)
             self.assertFalse(output_path.exists())
 
 

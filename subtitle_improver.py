@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Improve a target-language SRT using an English SRT as the meaning reference."""
+"""Translate or improve subtitles using an English SRT as the meaning reference."""
 
 from __future__ import annotations
 
@@ -177,28 +177,56 @@ def output_schema(allowed_ids: set[int]) -> dict[str, Any]:
     }
 
 
-def editor_instructions(target_language: str) -> str:
+def editor_instructions(target_language: str, mode: str) -> str:
+    if mode == "translate":
+        task = (
+            f"Translate every editable English subtitle cue into {target_language}. "
+            "Use the supplied surrounding English cues to preserve context."
+        )
+        wording_rule = (
+            "- Translate every non-empty editable cue. Do not leave English wording in the "
+            "result unless it is a name, title, or other term that should remain unchanged."
+        )
+        context_rule = (
+            "- Use the context-only cues and surrounding English cues to resolve sentences "
+            "that cross cue boundaries."
+        )
+    else:
+        task = (
+            f"Improve the editable {target_language} subtitle cues using the supplied "
+            "English cues as the authoritative meaning reference."
+        )
+        wording_rule = (
+            "- Keep correct existing target wording when it is already natural; repair "
+            "mistranslations, omissions, grammar, word choice, and awkward machine translation."
+        )
+        context_rule = (
+            "- Use the context-only target cues and surrounding English cues to resolve "
+            "sentences that cross cue boundaries."
+        )
+
     return f"""You are an expert audiovisual subtitle translator and editor.
-Improve the editable {target_language} subtitle cues using the supplied English cues as the authoritative meaning reference.
+{task}
 
 Rules:
 - Return exactly one result for every editable target cue ID, and no results for context-only cue IDs.
-- Never merge, delete, add, or renumber cues. Return only each cue's improved text.
+- Never merge, delete, add, or renumber cues. Return only each cue's resulting text.
 - If an editable target cue is already empty, return an empty string for that cue. Empty cues are intentional timing placeholders and must stay empty.
 - Preserve the meaning, tone, names, numbers, and level of formality in the English reference.
-- Keep correct existing target wording when it is already natural; repair mistranslations, omissions, grammar, word choice, and awkward machine translation.
+{wording_rule}
 - Keep the text concise enough for its existing screen time. Use at most two natural subtitle lines when practical.
 - Do not add explanations, speaker labels, quotation marks, timestamps, IDs, or commentary that are absent from the dialogue.
 - Write only in the requested target language. Preserve meaningful subtitle markup only when it is already present.
 - For Uyghur (ug), use standard Arabic-script Uyghur unless the requested language explicitly specifies Latin script.
 - For zh-Hans, zh-CN, or Simplified Chinese, use Simplified Chinese characters. For zh-Hant, zh-TW, zh-HK, or Traditional Chinese, use Traditional Chinese characters.
-- Use the context-only target cues and surrounding English cues to resolve sentences that cross cue boundaries.
+{context_rule}
 """
 
 
 def build_payload(
     model: str,
     target_language: str,
+    mode: str,
     reference: list[Cue],
     target: list[Cue],
     start_index: int,
@@ -215,6 +243,7 @@ def build_payload(
     )
     expected_ids = {cue.position for cue in editable}
     document = {
+        "operation": mode,
         "target_language": target_language,
         "english_reference_cues": [cue_for_prompt(cue) for cue in reference_context],
         "editable_target_cues": [cue_for_prompt(cue) for cue in editable],
@@ -228,13 +257,17 @@ def build_payload(
         "model": model,
         "store": False,
         "reasoning": {"effort": "low"},
-        "instructions": editor_instructions(target_language),
+        "instructions": editor_instructions(target_language, mode),
         "input": json.dumps(document, ensure_ascii=False, separators=(",", ":")),
         "max_output_tokens": 12_000,
         "text": {
             "format": {
                 "type": "json_schema",
-                "name": "improved_subtitle_cues",
+                "name": (
+                    "translated_subtitle_cues"
+                    if mode == "translate"
+                    else "improved_subtitle_cues"
+                ),
                 "strict": True,
                 "schema": output_schema(expected_ids),
             }
@@ -417,12 +450,14 @@ def checkpoint_signature(
     reference_path: Path,
     target_path: Path,
     target_language: str,
+    mode: str,
     model: str,
     chunk_size: int,
     target_count: int,
 ) -> dict[str, Any]:
     return {
-        "version": 1,
+        "version": 2,
+        "mode": mode,
         "reference_sha256": file_sha256(reference_path),
         "target_sha256": file_sha256(target_path),
         "target_language": target_language,
@@ -509,6 +544,7 @@ def improve_subtitle(
     target_path: Path,
     output_path: Path,
     target_language: str,
+    mode: str,
     model: str,
     api_url: str,
     api_key: str,
@@ -526,6 +562,7 @@ def improve_subtitle(
         reference_path,
         target_path,
         target_language,
+        mode,
         model,
         chunk_size,
         total,
@@ -535,10 +572,12 @@ def improve_subtitle(
 
     for start_index in range(completed_until, total, chunk_size):
         end_index = min(total, start_index + chunk_size)
-        print(f"Improving subtitle cues {start_index + 1}-{end_index} of {total}...", file=sys.stderr)
+        action = "Translating" if mode == "translate" else "Improving"
+        print(f"{action} subtitle cues {start_index + 1}-{end_index} of {total}...", file=sys.stderr)
         payload, expected_ids = build_payload(
             model,
             target_language,
+            mode,
             reference,
             target,
             start_index,
@@ -592,7 +631,7 @@ def improve_subtitle(
         save_checkpoint(checkpoint_path, signature, end_index, improved_text)
 
     if set(improved_text) != {cue.position for cue in target}:
-        raise SubtitleError("Not every target subtitle cue was improved.")
+        raise SubtitleError("Not every target subtitle cue was processed.")
     write_srt(output_path, target, improved_text)
 
     # Parse the generated file and prove that cue count and timing stayed unchanged.
@@ -612,11 +651,17 @@ def improve_subtitle(
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Improve a target-language SRT using English subtitles as reference."
+        description="Translate or improve an SRT using English subtitles as reference."
+    )
+    parser.add_argument(
+        "--mode",
+        choices=("improve", "translate"),
+        default="improve",
+        help="improve an existing target SRT or translate the English reference (default: improve)",
     )
     parser.add_argument("--reference", required=True, type=Path, help="English reference SRT")
-    parser.add_argument("--target", required=True, type=Path, help="Target-language SRT")
-    parser.add_argument("--output", required=True, type=Path, help="Improved output SRT")
+    parser.add_argument("--target", type=Path, help="Existing target-language SRT (improve mode)")
+    parser.add_argument("--output", required=True, type=Path, help="Translated or improved output SRT")
     parser.add_argument("--language", required=True, help="Target language name and/or code")
     parser.add_argument(
         "--model",
@@ -634,6 +679,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
+    if args.mode == "improve" and args.target is None:
+        print("--target is required in improve mode.", file=sys.stderr)
+        return 2
+    target_path = args.reference if args.mode == "translate" else args.target
+    assert target_path is not None
     api_key = os.environ.get("OPENAI_API_KEY", "").strip()
     if not api_key:
         print("OPENAI_API_KEY is not set in this shell.", file=sys.stderr)
@@ -645,18 +695,21 @@ def main(argv: list[str] | None = None) -> int:
     try:
         improve_subtitle(
             args.reference,
-            args.target,
+            target_path,
             args.output,
             args.language,
+            args.mode,
             args.model,
             api_url,
             api_key,
             args.chunk_size,
         )
     except SubtitleError as exc:
-        print(f"Subtitle improvement failed: {exc}", file=sys.stderr)
+        action = "translation" if args.mode == "translate" else "improvement"
+        print(f"Subtitle {action} failed: {exc}", file=sys.stderr)
         return 1
-    print(f"Improved subtitle saved to: {args.output}", file=sys.stderr)
+    adjective = "Translated" if args.mode == "translate" else "Improved"
+    print(f"{adjective} subtitle saved to: {args.output}", file=sys.stderr)
     return 0
 
 

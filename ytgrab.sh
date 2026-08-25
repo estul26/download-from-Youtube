@@ -18,6 +18,10 @@ FINAL_OUTPUT=""
 OUTPUT_BASE=""
 IMPROVED_SUBTITLE_OUTPUT=""
 OPENAI_IMPROVED_LANGUAGE=""
+OPENAI_SUBTITLE_ENABLED=0
+OPENAI_RUNTIME_API_KEY=""
+UNIQUE_SRT_PATH=""
+ENGLISH_SUBTITLE_FILE=""
 
 LANG1_REQUEST=""
 LANG2_REQUEST=""
@@ -115,14 +119,288 @@ check_standard_dependencies() {
   fi
 }
 
+# ---------- OpenAI subtitle consent ----------
+configure_openai_subtitle_use() {
+  local operation="$1"
+  local target_label="$2"
+  local prompt entered_key=""
+
+  OPENAI_SUBTITLE_ENABLED=0
+  OPENAI_RUNTIME_API_KEY=""
+  if [ "$operation" = "translate" ]; then
+    prompt="Use OpenAI with an API key to translate English subtitles into $target_label? Subtitle text will be sent to OpenAI and API usage may be billed."
+  else
+    prompt="Use OpenAI with an API key to improve the $target_label translation using English subtitles? Subtitle text will be sent to OpenAI and API usage may be billed."
+  fi
+
+  echo
+  ask_yes_no "$prompt" "no" || return 0
+
+  if ! need_command python3; then
+    echo "OpenAI subtitle translation requires Python 3."
+    echo "Install it with: brew install python"
+    echo "Continuing without OpenAI."
+    return 0
+  fi
+  if [ ! -f "$SCRIPT_DIR/subtitle_improver.py" ]; then
+    echo "Could not find subtitle_improver.py beside ytgrab.sh."
+    echo "Continuing without OpenAI."
+    return 0
+  fi
+
+  if [ -n "${OPENAI_API_KEY:-}" ]; then
+    OPENAI_RUNTIME_API_KEY="$OPENAI_API_KEY"
+  else
+    if ! IFS= read -r -s -p "OpenAI API key (input hidden; Enter cancels): " entered_key; then
+      entered_key=""
+    fi
+    echo
+    if [ -z "$entered_key" ]; then
+      echo "No API key was entered. Continuing without OpenAI."
+      return 0
+    fi
+    OPENAI_RUNTIME_API_KEY="$entered_key"
+    entered_key=""
+  fi
+  OPENAI_SUBTITLE_ENABLED=1
+}
+
+openai_translation_target_is_eligible() {
+  local code lower
+  code="$1"
+  valid_language_code "$code" || return 1
+  is_english_code "$code" && return 1
+  lower="$(printf '%s' "$code" | tr '[:upper:]' '[:lower:]')"
+  [ "$lower" != "all" ]
+}
+
+configure_openai_for_selected_pair() {
+  local target_label=""
+
+  OPENAI_SUBTITLE_ENABLED=0
+  OPENAI_RUNTIME_API_KEY=""
+  if is_english_code "$TRACK1_CODE" && ! is_english_code "$TRACK2_CODE"; then
+    target_label="$LANG2_LABEL"
+  elif is_english_code "$TRACK2_CODE" && ! is_english_code "$TRACK1_CODE"; then
+    target_label="$LANG1_LABEL"
+  else
+    echo
+    echo "OpenAI subtitle improvement is available only when exactly one selected track is English."
+    echo "The selected pair will be rendered without AI editing."
+    return 0
+  fi
+  configure_openai_subtitle_use "improve" "$target_label"
+}
+
 # ---------- Existing download modes ----------
+download_youtube_subtitles_direct() {
+  local subtitle_language="$1"
+  yt-dlp --cookies-from-browser "$BROWSER" --no-playlist --newline \
+    -o "$OUTDIR/%(title)s [%(id)s].%(ext)s" \
+    --skip-download --write-subs --write-auto-subs \
+    --sub-langs "$subtitle_language" --sub-format "srt/best" \
+    --convert-subs srt "$URL"
+}
+
+make_unique_srt_path() {
+  local candidate="$1"
+  local stem="${candidate%.srt}"
+  local number=2
+
+  while [ -e "$candidate" ]; do
+    candidate="$stem ($number).srt"
+    number=$((number + 1))
+  done
+  UNIQUE_SRT_PATH="$candidate"
+}
+
+cleanup_subtitle_workdir() {
+  local workdir="$1"
+  case "$workdir" in
+    "$OUTDIR"/ytgrab-subtitle-work.*)
+      [ -d "$workdir" ] && rm -rf -- "$workdir"
+      ;;
+    *)
+      echo "Refusing to remove unexpected subtitle work path: $workdir"
+      return 1
+      ;;
+  esac
+}
+
+find_preferred_english_srt() {
+  local workdir="$1"
+  local candidate
+
+  ENGLISH_SUBTITLE_FILE=""
+  for candidate in "$workdir"/*.en.srt; do
+    [ -f "$candidate" ] || continue
+    ENGLISH_SUBTITLE_FILE="$candidate"
+    return 0
+  done
+  for candidate in "$workdir"/*.en-*.srt "$workdir"/*.en_*.srt; do
+    [ -f "$candidate" ] || continue
+    ENGLISH_SUBTITLE_FILE="$candidate"
+    return 0
+  done
+  return 1
+}
+
+download_english_subtitle_for_translation() {
+  local workdir="$1"
+  local subtitle_template="$workdir/%(title)s [%(id)s].%(ext)s"
+  local common_args=(
+    --cookies-from-browser "$BROWSER"
+    --no-playlist
+    --newline
+    --skip-download
+    --sub-langs "en.*"
+    --sub-format "srt/best"
+    --convert-subs srt
+    -o "subtitle:$subtitle_template"
+  )
+
+  echo
+  echo "Downloading creator-provided English subtitles..."
+  yt-dlp "${common_args[@]}" --write-subs "$URL" || true
+  find_preferred_english_srt "$workdir" && return 0
+
+  echo "Creator-provided English subtitles were not found."
+  echo "Trying automatic English subtitles..."
+  yt-dlp "${common_args[@]}" --write-auto-subs "$URL" || true
+  find_preferred_english_srt "$workdir"
+}
+
+translate_youtube_subtitles_with_openai() {
+  local target_code="$1"
+  local workdir source_name source_output output_base safe_code
+  local translated_file translated_output model failure_choice
+
+  workdir="$(mktemp -d "$OUTDIR/ytgrab-subtitle-work.XXXXXX")" || {
+    echo "Could not create a subtitle working directory in $OUTDIR."
+    return 2
+  }
+  if ! download_english_subtitle_for_translation "$workdir"; then
+    echo "No usable English subtitle track was available for OpenAI translation."
+    cleanup_subtitle_workdir "$workdir" || true
+    return 1
+  fi
+
+  source_name="$(basename "$ENGLISH_SUBTITLE_FILE")"
+  make_unique_srt_path "$OUTDIR/$source_name"
+  source_output="$UNIQUE_SRT_PATH"
+  if ! mv -- "$ENGLISH_SUBTITLE_FILE" "$source_output"; then
+    echo "Could not save the downloaded English subtitle."
+    echo "Working files were preserved at:"
+    echo "  $workdir"
+    return 2
+  fi
+
+  output_base="${source_name%.srt}"
+  output_base="${output_base%.*}"
+  safe_code="$(printf '%s' "$target_code" | sed 's/[^A-Za-z0-9_-]/-/g')"
+  translated_file="$workdir/openai-translated.srt"
+  model="${OPENAI_SUBTITLE_MODEL:-gpt-5.4-mini}"
+  echo
+  echo "Model          : $model"
+  echo "Source language: English (en)"
+  echo "Target language: $target_code"
+
+  while ! OPENAI_API_KEY="$OPENAI_RUNTIME_API_KEY" \
+      python3 "$SCRIPT_DIR/subtitle_improver.py" \
+      --mode translate \
+      --reference "$source_output" \
+      --output "$translated_file" \
+      --language "$target_code" \
+      --model "$model"; do
+    echo
+    echo "Completed API chunks were checkpointed and can be resumed in this run."
+    echo "  1) Retry/resume OpenAI translation"
+    echo "  2) Download YouTube's $target_code subtitles instead"
+    echo "  3) Stop and preserve all working files"
+    while true; do
+      read -r -p "Choose [1-3]: " failure_choice
+      case "$failure_choice" in
+        1) break ;;
+        2) cleanup_subtitle_workdir "$workdir" || true; return 1 ;;
+        3)
+          echo "Working files were preserved at:"
+          echo "  $workdir"
+          return 2
+          ;;
+        *) echo "Please choose 1, 2, or 3." ;;
+      esac
+    done
+  done
+
+  make_unique_srt_path "$OUTDIR/$output_base [OpenAI-translated-$safe_code].srt"
+  translated_output="$UNIQUE_SRT_PATH"
+  if ! mv -- "$translated_file" "$translated_output"; then
+    echo "Could not move the translated subtitle to its final location."
+    echo "Working files were preserved at:"
+    echo "  $workdir"
+    return 2
+  fi
+  cleanup_subtitle_workdir "$workdir" || true
+  echo
+  echo "English SRT   : $source_output"
+  echo "Translated SRT: $translated_output"
+  return 0
+}
+
+run_subtitle_download() {
+  local subtitle_language translation_status
+
+  echo
+  echo "Enter the desired subtitle language code."
+  echo "Examples: en (English), fr (French), es (Spanish), or all"
+  read -r -p "Language [en]: " subtitle_language
+  subtitle_language="${subtitle_language:-en}"
+
+  OPENAI_SUBTITLE_ENABLED=0
+  OPENAI_RUNTIME_API_KEY=""
+  if openai_translation_target_is_eligible "$subtitle_language"; then
+    configure_openai_subtitle_use "translate" "$subtitle_language"
+  fi
+  prompt_url
+
+  echo
+  echo "Download type : SRT subtitles"
+  echo "Language      : $subtitle_language"
+  echo "Save folder   : $OUTDIR"
+  echo
+
+  if [ "$OPENAI_SUBTITLE_ENABLED" -ne 1 ]; then
+    download_youtube_subtitles_direct "$subtitle_language"
+    return
+  fi
+
+  translate_youtube_subtitles_with_openai "$subtitle_language"
+  translation_status=$?
+  case "$translation_status" in
+    0) return 0 ;;
+    1)
+      echo
+      if ask_yes_no "Download YouTube's $subtitle_language subtitles instead?" "yes"; then
+        download_youtube_subtitles_direct "$subtitle_language"
+        return
+      fi
+      echo "No target-language subtitle was downloaded."
+      return 1
+      ;;
+    *) return 1 ;;
+  esac
+}
+
 run_standard_download() {
   local type="$1"
   local format
   local audio_quality
-  local subtitle_language
 
   check_standard_dependencies || return 1
+  if [ "$type" = "4" ]; then
+    run_subtitle_download
+    return
+  fi
   prompt_url
 
   local common_args=(
@@ -185,20 +463,6 @@ run_standard_download() {
     yt-dlp "${common_args[@]}" -f "bestaudio/best" -x \
       --audio-format mp3 --audio-quality "$audio_quality" "$URL"
 
-  else
-    echo
-    echo "Enter a subtitle language code."
-    echo "Examples: en (English), fr (French), es (Spanish), or all"
-    read -r -p "Language [en]: " subtitle_language
-    subtitle_language="${subtitle_language:-en}"
-    echo
-    echo "Download type : SRT subtitles"
-    echo "Language      : $subtitle_language"
-    echo "Save folder   : $OUTDIR"
-    echo
-    yt-dlp "${common_args[@]}" --skip-download --write-subs --write-auto-subs \
-      --sub-langs "$subtitle_language" --sub-format "srt/best" \
-      --convert-subs srt "$URL"
   fi
 }
 
@@ -354,7 +618,7 @@ is_english_code() {
   local code
   code="$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')"
   case "$code" in
-    en|en-*|english) return 0 ;;
+    en|en-*|en_*|english) return 0 ;;
     *) return 1 ;;
   esac
 }
@@ -881,6 +1145,8 @@ maybe_improve_subtitle_with_openai() {
   local reference_file target_file target_label target_code
   local improved_file backup_file model failure_choice
 
+  [ "$OPENAI_SUBTITLE_ENABLED" -eq 1 ] || return 0
+
   if is_english_code "$TRACK1_CODE" && ! is_english_code "$TRACK2_CODE"; then
     reference_file="$DUAL_WORKDIR/language1.srt"
     target_file="$DUAL_WORKDIR/language2.srt"
@@ -892,35 +1158,8 @@ maybe_improve_subtitle_with_openai() {
     target_label="$LANG1_LABEL"
     target_code="$TRACK1_CODE"
   else
-    echo
-    echo "OpenAI subtitle improvement needs exactly one English track."
-    echo "The selected pair will be rendered without AI editing."
+    echo "OpenAI subtitle improvement could not identify exactly one English track."
     return 0
-  fi
-
-  echo
-  echo "OpenAI can improve the $target_label subtitle using English as reference."
-  echo "Subtitle text will be sent to the OpenAI API and API usage will be billed."
-  ask_yes_no "Improve the $target_label subtitle now?" "yes" || return 0
-
-  if [ -z "${OPENAI_API_KEY:-}" ]; then
-    echo
-    echo "OPENAI_API_KEY is not available in this Terminal session."
-    echo "Run 'source ~/.zshrc' and start the downloader again."
-    echo "The subtitle was not changed."
-    ask_yes_no "Continue without OpenAI improvement?" "yes" && return 0
-    return 1
-  fi
-  if ! need_command python3; then
-    echo "OpenAI subtitle improvement requires Python 3."
-    echo "Install it with: brew install python"
-    ask_yes_no "Continue without OpenAI improvement?" "yes" && return 0
-    return 1
-  fi
-  if [ ! -f "$SCRIPT_DIR/subtitle_improver.py" ]; then
-    echo "Could not find subtitle_improver.py beside ytgrab.sh."
-    ask_yes_no "Continue without OpenAI improvement?" "yes" && return 0
-    return 1
   fi
 
   model="${OPENAI_SUBTITLE_MODEL:-gpt-5.4-mini}"
@@ -932,7 +1171,8 @@ maybe_improve_subtitle_with_openai() {
     echo "Could not create a temporary backup of the target subtitle."
     return 1
   fi
-  while ! python3 "$SCRIPT_DIR/subtitle_improver.py" \
+  while ! OPENAI_API_KEY="$OPENAI_RUNTIME_API_KEY" \
+    python3 "$SCRIPT_DIR/subtitle_improver.py" \
     --reference "$reference_file" \
     --target "$target_file" \
     --output "$improved_file" \
@@ -1237,6 +1477,7 @@ prepare_youtube_dual_workflow() {
       echo "Choose another language pair, or press Control-C to stop."
     fi
   done
+  configure_openai_for_selected_pair
   choose_video_quality
   OUTPUT_BASE="$(metadata_query base)"
   echo
@@ -1254,6 +1495,7 @@ prepare_local_dual_workflow() {
   choose_language_pair
   TRACK1_CODE="$LANG1_OUTPUT"; TRACK2_CODE="$LANG2_OUTPUT"
   TRACK1_CATEGORY="local"; TRACK2_CATEGORY="local"
+  configure_openai_for_selected_pair
 
   echo
   echo "Choose the local video in Finder..."
@@ -1301,6 +1543,8 @@ prepare_local_dual_workflow() {
 
 run_dual_subtitle_workflow() {
   local source_choice prepare_status preview_status
+  OPENAI_SUBTITLE_ENABLED=0
+  OPENAI_RUNTIME_API_KEY=""
   echo
   echo "Choose source for the dual-subtitle video:"
   echo "  1) Download video and captions from YouTube"
@@ -1427,9 +1671,13 @@ main() {
         echo "  $IMPROVED_SUBTITLE_OUTPUT"
       fi
     else
-      echo "Download failed."
-      echo "Try updating yt-dlp:"
-      echo "  brew upgrade yt-dlp"
+      if [ "$TYPE" = "4" ]; then
+        echo "Subtitle download or translation failed."
+      else
+        echo "Download failed."
+        echo "Try updating yt-dlp:"
+        echo "  brew upgrade yt-dlp"
+      fi
     fi
     echo "========================================"
     return "$STATUS"

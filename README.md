@@ -42,7 +42,7 @@ Options 1 through 4 require:
 brew install yt-dlp ffmpeg
 ```
 
-Optional OpenAI subtitle improvement also requires Python 3:
+Optional OpenAI subtitle translation and improvement also requires Python 3:
 
 ```bash
 brew install python
@@ -73,19 +73,52 @@ brew upgrade yt-dlp ffmpeg ffmpeg-full
 
 ## Downloaded videos, audio, and captions
 
-Options 1 through 4 keep their original behavior:
+Options 1 through 3 keep their original behavior, and declining OpenAI in
+option 4 keeps its original caption-download behavior:
 
 - MP4 prefers MP4 video and M4A audio for Mac, QuickTime, and iPhone support.
 - MKV accepts the best available YouTube video and audio codecs.
 - MP3 offers 320, 192, or 128 kbps conversion.
 - Subtitle mode downloads creator captions when available, otherwise automatic
-  captions, and converts them to SRT.
+  captions, and converts them to SRT. It can optionally translate English
+  captions into one requested language with OpenAI.
 
 The script uses Chrome cookies for YouTube access:
 
 ```bash
 --cookies-from-browser chrome
 ```
+
+## Translate English captions with OpenAI
+
+Choose option 4 and enter the desired output language code before entering the
+YouTube URL. For a single non-English code such as `tr`, `fr`, `ug`, or
+`zh-Hans`, the downloader asks:
+
+```text
+Use OpenAI with an API key to translate English subtitles into tr?
+Subtitle text will be sent to OpenAI and API usage may be billed. [y/N]
+```
+
+Pressing Enter selects **No** and downloads YouTube's requested caption track
+exactly as before. English codes such as `en` and `en-US`, `all`, and
+multi-language or regular-expression selections also use the normal download
+path without showing the OpenAI prompt.
+
+If you opt in, the downloader first tries creator-provided English captions,
+then English automatic captions. The English cue numbering and timestamps
+become the template for a new translation in the requested language. Both SRT
+files are kept, with names such as:
+
+```text
+Example Video [abc123].en.srt
+Example Video [abc123] [OpenAI-translated-tr].srt
+```
+
+Existing files are never overwritten; later copies receive ` (2)`, ` (3)`,
+and so on. If no English captions are available, or the API translation still
+fails after its automatic and interactive retries, the downloader offers to
+download YouTube's requested target-language captions instead.
 
 ## Burn two subtitle languages into a video
 
@@ -150,7 +183,9 @@ When exactly one of the two selected tracks is English, option 5 offers to
 improve the other language using the English track as the meaning reference.
 This works with the built-in Simplified Chinese, Turkish, and Uyghur pairs, as
 well as a custom pair containing an English language code such as `en` or
-`en-US`.
+`en-US`. The question appears immediately after the language pair is resolved,
+before the YouTube media download or local Finder file selection. Pressing
+Enter selects **No**, and the video proceeds without OpenAI editing.
 
 The editor uses timestamps to match the English context, so the two subtitle
 files do not need to have the same number of cues. It repairs mistranslations,
@@ -172,9 +207,16 @@ original subtitle, or stop while preserving the working files. Retrying in the
 same run resumes at the first unfinished chunk instead of billing completed
 chunks again.
 
-Create an OpenAI API key and store it outside this repository as the
-`OPENAI_API_KEY` environment variable. On macOS with Zsh, open `~/.zshrc` in a
-text editor and add:
+When you opt in, an existing `OPENAI_API_KEY` environment variable is used. If
+it is not set, the downloader asks for the key with hidden terminal input. A
+key entered at that prompt is kept only in the running script's memory, passed
+to the Python child through its environment, and never written to disk or
+placed in command arguments. Press Enter at the hidden prompt to cancel
+OpenAI and continue normally.
+
+To avoid entering the key for every run, store it outside this repository as
+the `OPENAI_API_KEY` environment variable. On macOS with Zsh, open `~/.zshrc`
+in a text editor and add:
 
 ```bash
 export OPENAI_API_KEY='your-api-key-here'
@@ -188,18 +230,28 @@ source ~/.zshrc
 
 Do not put the key inside `ytgrab.sh`, `subtitle_improver.py`, or any committed
 file. `.env` files are ignored as an extra safeguard, although this project
-does not require one.
+does not require one. The script never sends a request merely to validate a
+key; the first request is the translation or improvement you approved.
 
-The prompt shows the model and asks before making a billed API request. The
-default is `gpt-5.4-mini`; override it for one Terminal session if needed:
+The default model is `gpt-5.4-mini`; override it for one Terminal session if
+needed:
 
 ```bash
 export OPENAI_SUBTITLE_MODEL='gpt-5.4-mini'
 ```
 
-Requests use the OpenAI Responses API with strict structured output and
-`store: false`. The improved subtitle is used for the burned-in video and is
-also saved as a separate file such as:
+Requests use the [OpenAI Responses API](https://developers.openai.com/api/reference/cli/resources/responses/methods/create)
+with strict structured output and `store: false`. You can also invoke the
+translator directly:
+
+```bash
+python3 subtitle_improver.py --mode translate \
+  --reference english.srt --output translated.srt --language tr
+```
+
+Without `--mode`, the command retains its existing improvement behavior and
+requires `--target`. In option 5, the improved subtitle is used for the
+burned-in video and is also saved as a separate file such as:
 
 ```text
 Example Video [abc123] [OpenAI-improved-ug].srt
