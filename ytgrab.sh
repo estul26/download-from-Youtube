@@ -5,6 +5,7 @@
 
 set -u
 
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd -P)"
 BROWSER="chrome"
 OUTDIR="$HOME/Downloads/YouTube"
 
@@ -15,6 +16,8 @@ DUAL_WORKDIR=""
 VIDEO_SOURCE=""
 FINAL_OUTPUT=""
 OUTPUT_BASE=""
+IMPROVED_SUBTITLE_OUTPUT=""
+OPENAI_IMPROVED_LANGUAGE=""
 
 LANG1_REQUEST=""
 LANG2_REQUEST=""
@@ -347,6 +350,15 @@ is_uyghur_code() {
   esac
 }
 
+is_english_code() {
+  local code
+  code="$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')"
+  case "$code" in
+    en|en-*|english) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
 choose_language_pair() {
   local pair_choice first_code second_code first_lower second_lower
 
@@ -596,28 +608,75 @@ resolve_youtube_pair() {
 
 # ---------- Working files and media helpers ----------
 create_dual_workdir() {
+  mkdir -p -- "$OUTDIR" || return 1
   DUAL_WORKDIR="$(mktemp -d "$OUTDIR/ytgrab-work.XXXXXX")" || return 1
+}
+
+dual_workdir_path_is_safe() {
+  [ -n "$DUAL_WORKDIR" ] || return 1
+  case "$DUAL_WORKDIR" in
+    "$OUTDIR"/ytgrab-work.*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+ensure_dual_workdir() {
+  if ! dual_workdir_path_is_safe; then
+    echo "The working-directory path is missing or invalid."
+    return 1
+  fi
+  if [ ! -d "$DUAL_WORKDIR" ]; then
+    if ! mkdir -p -- "$DUAL_WORKDIR"; then
+      echo "Could not recreate the working directory: $DUAL_WORKDIR"
+      return 1
+    fi
+    echo "The working directory had been removed, so it was recreated."
+  fi
+}
+
+dual_workdir_has_recoverable_files() {
+  local candidate
+  [ -d "$DUAL_WORKDIR" ] || return 1
+  for candidate in \
+      "$DUAL_WORKDIR"/source.* \
+      "$DUAL_WORKDIR"/subtitle.* \
+      "$DUAL_WORKDIR"/language*.srt \
+      "$DUAL_WORKDIR"/openai-* \
+      "$DUAL_WORKDIR"/target-before-openai.srt \
+      "$DUAL_WORKDIR"/*.checkpoint.json \
+      "$DUAL_WORKDIR"/combined.ass \
+      "$DUAL_WORKDIR"/preview*.mp4 \
+      "$DUAL_WORKDIR"/final.partial.mp4; do
+    [ -f "$candidate" ] && return 0
+  done
+  return 1
 }
 
 cleanup_dual_workdir() {
   if [ -n "$DUAL_WORKDIR" ]; then
-    case "$DUAL_WORKDIR" in
-      "$OUTDIR"/ytgrab-work.*)
+    if dual_workdir_path_is_safe; then
         rm -rf -- "$DUAL_WORKDIR"
         DUAL_WORKDIR=""
-        ;;
-      *)
-        echo "Refusing to remove unexpected work path: $DUAL_WORKDIR"
-        return 1
-        ;;
-    esac
+    else
+      echo "Refusing to remove unexpected work path: $DUAL_WORKDIR"
+      return 1
+    fi
   fi
+}
+
+cleanup_unneeded_dual_workdir() {
+  if [ -z "$DUAL_WORKDIR" ] || [ ! -d "$DUAL_WORKDIR" ]; then
+    DUAL_WORKDIR=""
+    return 0
+  fi
+  dual_workdir_has_recoverable_files && return 1
+  cleanup_dual_workdir
 }
 
 handle_dual_interrupt() {
   echo
   echo "Dual-subtitle encoding was interrupted."
-  if [ -n "$DUAL_WORKDIR" ]; then
+  if ! cleanup_unneeded_dual_workdir; then
     echo "Working files were preserved at:"
     echo "  $DUAL_WORKDIR"
   fi
@@ -804,6 +863,113 @@ make_unique_output_path() {
     number=$((number + 1))
   done
   FINAL_OUTPUT="$candidate"
+}
+
+make_unique_improved_subtitle_path() {
+  local language_code="$1"
+  local safe_code candidate number=2
+  safe_code="$(printf '%s' "$language_code" | sed 's/[^A-Za-z0-9_-]/-/g')"
+  candidate="$OUTDIR/$OUTPUT_BASE [OpenAI-improved-$safe_code].srt"
+  while [ -e "$candidate" ]; do
+    candidate="$OUTDIR/$OUTPUT_BASE [OpenAI-improved-$safe_code] ($number).srt"
+    number=$((number + 1))
+  done
+  IMPROVED_SUBTITLE_OUTPUT="$candidate"
+}
+
+maybe_improve_subtitle_with_openai() {
+  local reference_file target_file target_label target_code
+  local improved_file backup_file model failure_choice
+
+  if is_english_code "$TRACK1_CODE" && ! is_english_code "$TRACK2_CODE"; then
+    reference_file="$DUAL_WORKDIR/language1.srt"
+    target_file="$DUAL_WORKDIR/language2.srt"
+    target_label="$LANG2_LABEL"
+    target_code="$TRACK2_CODE"
+  elif is_english_code "$TRACK2_CODE" && ! is_english_code "$TRACK1_CODE"; then
+    reference_file="$DUAL_WORKDIR/language2.srt"
+    target_file="$DUAL_WORKDIR/language1.srt"
+    target_label="$LANG1_LABEL"
+    target_code="$TRACK1_CODE"
+  else
+    echo
+    echo "OpenAI subtitle improvement needs exactly one English track."
+    echo "The selected pair will be rendered without AI editing."
+    return 0
+  fi
+
+  echo
+  echo "OpenAI can improve the $target_label subtitle using English as reference."
+  echo "Subtitle text will be sent to the OpenAI API and API usage will be billed."
+  ask_yes_no "Improve the $target_label subtitle now?" "yes" || return 0
+
+  if [ -z "${OPENAI_API_KEY:-}" ]; then
+    echo
+    echo "OPENAI_API_KEY is not available in this Terminal session."
+    echo "Run 'source ~/.zshrc' and start the downloader again."
+    echo "The subtitle was not changed."
+    ask_yes_no "Continue without OpenAI improvement?" "yes" && return 0
+    return 1
+  fi
+  if ! need_command python3; then
+    echo "OpenAI subtitle improvement requires Python 3."
+    echo "Install it with: brew install python"
+    ask_yes_no "Continue without OpenAI improvement?" "yes" && return 0
+    return 1
+  fi
+  if [ ! -f "$SCRIPT_DIR/subtitle_improver.py" ]; then
+    echo "Could not find subtitle_improver.py beside ytgrab.sh."
+    ask_yes_no "Continue without OpenAI improvement?" "yes" && return 0
+    return 1
+  fi
+
+  model="${OPENAI_SUBTITLE_MODEL:-gpt-5.4-mini}"
+  improved_file="$DUAL_WORKDIR/openai-improved.srt"
+  backup_file="$DUAL_WORKDIR/target-before-openai.srt"
+  echo "Model          : $model"
+  echo "Target language: $target_label ($target_code)"
+  if ! cp -- "$target_file" "$backup_file"; then
+    echo "Could not create a temporary backup of the target subtitle."
+    return 1
+  fi
+  while ! python3 "$SCRIPT_DIR/subtitle_improver.py" \
+    --reference "$reference_file" \
+    --target "$target_file" \
+    --output "$improved_file" \
+    --language "$target_label ($target_code)" \
+    --model "$model"; do
+    echo "The original $target_label subtitle remains unchanged."
+    echo "Completed API chunks were checkpointed and will not be requested again."
+    echo
+    echo "  1) Retry/resume OpenAI improvement"
+    echo "  2) Continue with the original subtitle"
+    echo "  3) Stop and preserve all working files"
+    while true; do
+      read -r -p "Choose [1-3]: " failure_choice
+      case "$failure_choice" in
+        1) break ;;
+        2) return 0 ;;
+        3) return 1 ;;
+        *) echo "Please choose 1, 2, or 3." ;;
+      esac
+    done
+  done
+  if ! mv -f -- "$improved_file" "$target_file"; then
+    echo "Could not activate the improved subtitle."
+    return 1
+  fi
+
+  make_unique_improved_subtitle_path "$target_code"
+  if ! cp -- "$target_file" "$IMPROVED_SUBTITLE_OUTPUT"; then
+    echo "Warning: the improved subtitle will be used in the video but could not be saved separately."
+    IMPROVED_SUBTITLE_OUTPUT=""
+  fi
+  OPENAI_IMPROVED_LANGUAGE="$target_label"
+  echo
+  echo "$target_label subtitle improved successfully."
+  if [ -n "$IMPROVED_SUBTITLE_OUTPUT" ]; then
+    echo "Improved SRT  : $IMPROVED_SUBTITLE_OUTPUT"
+  fi
 }
 
 subtitle_intervals() {
@@ -1003,6 +1169,7 @@ render_full_video() {
 
 download_youtube_dual_sources() {
   local format escaped1 escaped2 subtitle_pattern found
+  ensure_dual_workdir || return 1
   if [ -z "$HEIGHT" ]; then
     format='bv*[dynamic_range=SDR]+ba/b[dynamic_range=SDR]'
   else
@@ -1053,6 +1220,7 @@ prepare_youtube_dual_workflow() {
   prompt_url
   echo
   echo "Reading YouTube caption metadata..."
+  ensure_dual_workdir || return 1
   if ! yt-dlp --cookies-from-browser "$BROWSER" --no-playlist --quiet \
       --simulate --skip-download --write-subs --write-auto-subs --dump-single-json \
       "$URL" > "$DUAL_WORKDIR/metadata.json"; then
@@ -1113,6 +1281,7 @@ prepare_local_dual_workflow() {
     echo "Option 5 currently supports SDR sources only to avoid washed-out colors."
     return 1
   fi
+  ensure_dual_workdir || return 1
   normalize_subtitle "$subtitle1" "$DUAL_WORKDIR/language1.srt" || {
     echo "Could not read the $LANG1_LABEL subtitle file."; return 1;
   }
@@ -1154,11 +1323,15 @@ run_dual_subtitle_workflow() {
   if [ "$prepare_status" -eq 2 ]; then
     cleanup_dual_workdir; trap - INT TERM; return 2
   elif [ "$prepare_status" -ne 0 ]; then
+    cleanup_unneeded_dual_workdir || true
     trap - INT TERM; return "$prepare_status"
   fi
 
   if video_is_hdr "$VIDEO_SOURCE"; then
     echo "The selected source is HDR (PQ or HLG), but option 5 supports SDR only."
+    trap - INT TERM; return 1
+  fi
+  if ! maybe_improve_subtitle_with_openai; then
     trap - INT TERM; return 1
   fi
   if ! build_combined_subtitle_ass; then
@@ -1219,6 +1392,10 @@ main() {
       echo "Dual-subtitle video finished!"
       echo "Saved as:"
       echo "  $FINAL_OUTPUT"
+      if [ -n "$IMPROVED_SUBTITLE_OUTPUT" ]; then
+        echo "OpenAI-improved $OPENAI_IMPROVED_LANGUAGE subtitle:"
+        echo "  $IMPROVED_SUBTITLE_OUTPUT"
+      fi
     else
       echo "Download finished!"
       echo "Saved to:"
@@ -1230,15 +1407,24 @@ main() {
     fi
     return 0
   elif [ "$STATUS" -eq 2 ]; then
-    echo "No output was created."
+    if [ -n "$IMPROVED_SUBTITLE_OUTPUT" ]; then
+      echo "Video encoding was cancelled. The improved subtitle was saved as:"
+      echo "  $IMPROVED_SUBTITLE_OUTPUT"
+    else
+      echo "No output was created."
+    fi
     return 0
   else
     echo "========================================"
     if [ "$TYPE" = "5" ]; then
       echo "Dual-subtitle video failed."
-      if [ -n "$DUAL_WORKDIR" ]; then
+      if [ -n "$DUAL_WORKDIR" ] && [ -d "$DUAL_WORKDIR" ]; then
         echo "Working files were preserved at:"
         echo "  $DUAL_WORKDIR"
+      fi
+      if [ -n "$IMPROVED_SUBTITLE_OUTPUT" ]; then
+        echo "The improved subtitle was saved as:"
+        echo "  $IMPROVED_SUBTITLE_OUTPUT"
       fi
     else
       echo "Download failed."
