@@ -83,11 +83,26 @@ option 4 keeps its original caption-download behavior:
   captions, and converts them to SRT. It can optionally translate English
   captions into one requested language with OpenAI.
 
-The script uses Chrome cookies for YouTube access:
+The script now detects usable browser cookie databases automatically on macOS.
+It checks Safari, Chrome, and Firefox in that order. If no browser cookie database
+is available, it tries the YouTube request without cookies. If cookie extraction
+itself fails, the same request is retried once without browser cookies.
+
+You can override the browser for one run:
 
 ```bash
---cookies-from-browser chrome
+YTGRAB_BROWSER=chrome ./ytgrab.sh
+YTGRAB_BROWSER=firefox ./ytgrab.sh
 ```
+
+Or explicitly disable browser cookies:
+
+```bash
+YTGRAB_BROWSER=none ./ytgrab.sh
+```
+
+An explicit browser override is passed to `yt-dlp`, so profile syntax supported
+by `yt-dlp` can also be used.
 
 ## Translate English captions with OpenAI
 
