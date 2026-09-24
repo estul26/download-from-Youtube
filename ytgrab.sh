@@ -124,7 +124,7 @@ run_ytdlp() {
   local cookie_log status
 
   configure_cookie_args
-  if [ "${#COOKIE_ARGS[@]}" -eq 0 ]; then
+  if [ -z "$COOKIE_BROWSER" ]; then
     yt-dlp "$@"
     return $?
   fi
