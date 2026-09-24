@@ -1,12 +1,16 @@
 #!/usr/bin/env bash
 
 # Interactive YouTube downloader for macOS.
-# Uses Chrome cookies because that works well with YouTube's current access checks.
+# Browser cookies are detected automatically when available. If browser-cookie
+# extraction fails, public YouTube downloads are retried without cookies.
 
 set -u
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd -P)"
-BROWSER="chrome"
+BROWSER="${YTGRAB_BROWSER:-auto}"
+COOKIE_BROWSER=""
+COOKIE_CONFIGURED=0
+COOKIE_ARGS=()
 OUTDIR="$HOME/Downloads/YouTube"
 
 DUAL_FFMPEG=""
@@ -45,6 +49,109 @@ mkdir -p "$OUTDIR"
 # ---------- General helpers ----------
 need_command() {
   command -v "$1" >/dev/null 2>&1
+}
+
+browser_cookie_store_exists() {
+  local browser="$1"
+  local root
+
+  case "$browser" in
+    safari)
+      [ -f "$HOME/Library/Cookies/Cookies.binarycookies" ] || \
+        [ -f "$HOME/Library/Containers/com.apple.Safari/Data/Library/Cookies/Cookies.binarycookies" ]
+      ;;
+    chrome)
+      root="$HOME/Library/Application Support/Google/Chrome"
+      [ -d "$root" ] || return 1
+      find "$root" -maxdepth 4 -type f -name Cookies -print -quit 2>/dev/null | grep -q .
+      ;;
+    firefox)
+      root="$HOME/Library/Application Support/Firefox/Profiles"
+      [ -d "$root" ] || return 1
+      find "$root" -maxdepth 3 -type f -name cookies.sqlite -print -quit 2>/dev/null | grep -q .
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+configure_cookie_args() {
+  local requested candidate
+
+  [ "$COOKIE_CONFIGURED" -eq 1 ] && return 0
+  COOKIE_CONFIGURED=1
+  COOKIE_BROWSER=""
+  COOKIE_ARGS=()
+  requested="$(printf '%s' "$BROWSER" | tr '[:upper:]' '[:lower:]')"
+
+  case "$requested" in
+    ""|auto)
+      for candidate in safari chrome firefox; do
+        if browser_cookie_store_exists "$candidate"; then
+          COOKIE_BROWSER="$candidate"
+          break
+        fi
+      done
+      ;;
+    none|off|no)
+      echo "Browser cookies disabled by YTGRAB_BROWSER=$BROWSER." >&2
+      return 0
+      ;;
+    *)
+      # An explicit override is intentional. Let yt-dlp validate the browser
+      # name/profile and fall back without cookies only if extraction fails.
+      COOKIE_BROWSER="$BROWSER"
+      ;;
+  esac
+
+  if [ -n "$COOKIE_BROWSER" ]; then
+    COOKIE_ARGS=(--cookies-from-browser "$COOKIE_BROWSER")
+    echo "Using browser cookies from: $COOKIE_BROWSER" >&2
+  else
+    echo "No browser cookie database found; trying YouTube without cookies." >&2
+  fi
+}
+
+cookie_error_detected() {
+  local log_file="$1"
+  grep -Eiq \
+    'could not find .*cookies|cookies? database|failed to (copy|decrypt).*cookies?|cookies?.*(decrypt|permission|access)|permission.*cookies?' \
+    "$log_file"
+}
+
+run_ytdlp() {
+  local cookie_log status
+
+  configure_cookie_args
+  if [ "${#COOKIE_ARGS[@]}" -eq 0 ]; then
+    yt-dlp "$@"
+    return $?
+  fi
+
+  cookie_log="$(mktemp "${TMPDIR:-/tmp}/ytgrab-cookie-error.XXXXXX")" || {
+    yt-dlp "${COOKIE_ARGS[@]}" "$@"
+    return $?
+  }
+
+  yt-dlp "${COOKIE_ARGS[@]}" "$@" 2>"$cookie_log"
+  status=$?
+  if [ -s "$cookie_log" ]; then
+    cat "$cookie_log" >&2
+  fi
+
+  if [ "$status" -ne 0 ] && cookie_error_detected "$cookie_log"; then
+    echo >&2
+    echo "Browser-cookie extraction failed; retrying without browser cookies..." >&2
+    rm -f -- "$cookie_log"
+    COOKIE_ARGS=()
+    COOKIE_BROWSER=""
+    yt-dlp "$@"
+    return $?
+  fi
+
+  rm -f -- "$cookie_log"
+  return "$status"
 }
 
 ask_yes_no() {
@@ -195,7 +302,7 @@ configure_openai_for_selected_pair() {
 # ---------- Existing download modes ----------
 download_youtube_subtitles_direct() {
   local subtitle_language="$1"
-  yt-dlp --cookies-from-browser "$BROWSER" --no-playlist --newline \
+  run_ytdlp --no-playlist --newline \
     -o "$OUTDIR/%(title)s [%(id)s].%(ext)s" \
     --skip-download --write-subs --write-auto-subs \
     --sub-langs "$subtitle_language" --sub-format "srt/best" \
@@ -249,7 +356,6 @@ download_english_subtitle_for_translation() {
   local workdir="$1"
   local subtitle_template="$workdir/%(title)s [%(id)s].%(ext)s"
   local common_args=(
-    --cookies-from-browser "$BROWSER"
     --no-playlist
     --newline
     --skip-download
@@ -261,12 +367,12 @@ download_english_subtitle_for_translation() {
 
   echo
   echo "Downloading creator-provided English subtitles..."
-  yt-dlp "${common_args[@]}" --write-subs "$URL" || true
+  run_ytdlp "${common_args[@]}" --write-subs "$URL" || true
   find_preferred_english_srt "$workdir" && return 0
 
   echo "Creator-provided English subtitles were not found."
   echo "Trying automatic English subtitles..."
-  yt-dlp "${common_args[@]}" --write-auto-subs "$URL" || true
+  run_ytdlp "${common_args[@]}" --write-auto-subs "$URL" || true
   find_preferred_english_srt "$workdir"
 }
 
@@ -404,7 +510,6 @@ run_standard_download() {
   prompt_url
 
   local common_args=(
-    --cookies-from-browser "$BROWSER"
     --no-playlist
     --newline
     -o "$OUTDIR/%(title)s [%(id)s].%(ext)s"
@@ -424,14 +529,14 @@ run_standard_download() {
       else
         format="bv*[ext=mp4][height<=${HEIGHT}]+ba[ext=m4a]/b[ext=mp4][height<=${HEIGHT}]/bv*[height<=${HEIGHT}]+ba/b[height<=${HEIGHT}]"
       fi
-      yt-dlp "${common_args[@]}" -f "$format" --merge-output-format mp4 "$URL"
+      run_ytdlp "${common_args[@]}" -f "$format" --merge-output-format mp4 "$URL"
     else
       if [ -z "$HEIGHT" ]; then
         format='bv*+ba/b'
       else
         format="bv*[height<=${HEIGHT}]+ba/b[height<=${HEIGHT}]"
       fi
-      yt-dlp "${common_args[@]}" -f "$format" --merge-output-format mkv "$URL"
+      run_ytdlp "${common_args[@]}" -f "$format" --merge-output-format mkv "$URL"
     fi
 
   elif [ "$type" = "3" ]; then
@@ -460,7 +565,7 @@ run_standard_download() {
     echo "Quality       : $LABEL"
     echo "Save folder   : $OUTDIR"
     echo
-    yt-dlp "${common_args[@]}" -f "bestaudio/best" -x \
+    run_ytdlp "${common_args[@]}" -f "bestaudio/best" -x \
       --audio-format mp3 --audio-quality "$audio_quality" "$URL"
 
   fi
@@ -1421,7 +1526,7 @@ download_youtube_dual_sources() {
 
   echo
   echo "Downloading SDR source video and both subtitle tracks..."
-  yt-dlp --cookies-from-browser "$BROWSER" --no-playlist --newline \
+  run_ytdlp --no-playlist --newline \
     --ffmpeg-location "$(dirname "$DUAL_FFMPEG")" -f "$format" \
     --merge-output-format mkv --write-subs --write-auto-subs \
     --sub-langs "$subtitle_pattern" --sub-format "srt/vtt/ass/best" --convert-subs srt \
@@ -1461,7 +1566,7 @@ prepare_youtube_dual_workflow() {
   echo
   echo "Reading YouTube caption metadata..."
   ensure_dual_workdir || return 1
-  if ! yt-dlp --cookies-from-browser "$BROWSER" --no-playlist --quiet \
+  if ! run_ytdlp --no-playlist --quiet \
       --simulate --skip-download --write-subs --write-auto-subs --dump-single-json \
       "$URL" > "$DUAL_WORKDIR/metadata.json"; then
     echo "Could not read YouTube video or caption metadata."
