@@ -18,7 +18,7 @@ from typing import Any
 
 
 DEFAULT_API_URL = "https://api.openai.com/v1/responses"
-DEFAULT_MODEL = "gpt-5.4-mini"
+DEFAULT_MODEL = "gpt-6-luna"
 DEFAULT_CHUNK_SIZE = 60
 CONTEXT_CUES = 2
 CONTEXT_MILLISECONDS = 10_000
