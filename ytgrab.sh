@@ -299,7 +299,7 @@ translate_youtube_subtitles_with_openai() {
   output_base="${output_base%.*}"
   safe_code="$(printf '%s' "$target_code" | sed 's/[^A-Za-z0-9_-]/-/g')"
   translated_file="$workdir/openai-translated.srt"
-  model="${OPENAI_SUBTITLE_MODEL:-gpt-5.4-mini}"
+  model="${OPENAI_SUBTITLE_MODEL:-gpt-6-luna}"
   echo
   echo "Model          : $model"
   echo "Source language: English (en)"
@@ -1162,7 +1162,7 @@ maybe_improve_subtitle_with_openai() {
     return 0
   fi
 
-  model="${OPENAI_SUBTITLE_MODEL:-gpt-5.4-mini}"
+  model="${OPENAI_SUBTITLE_MODEL:-gpt-6-luna}"
   improved_file="$DUAL_WORKDIR/openai-improved.srt"
   backup_file="$DUAL_WORKDIR/target-before-openai.srt"
   echo "Model          : $model"

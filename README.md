@@ -233,11 +233,11 @@ file. `.env` files are ignored as an extra safeguard, although this project
 does not require one. The script never sends a request merely to validate a
 key; the first request is the translation or improvement you approved.
 
-The default model is `gpt-5.4-mini`; override it for one Terminal session if
+The default model is `gpt-6-luna`; override it for one Terminal session if
 needed:
 
 ```bash
-export OPENAI_SUBTITLE_MODEL='gpt-5.4-mini'
+export OPENAI_SUBTITLE_MODEL='gpt-6-luna'
 ```
 
 Requests use the [OpenAI Responses API](https://developers.openai.com/api/reference/cli/resources/responses/methods/create)
