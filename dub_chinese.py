@@ -166,7 +166,9 @@ def load_voice(directory: Path) -> Voice:
 
 def check_server(api_url: str) -> None:
     try:
-        urllib.request.urlopen(api_url.rstrip("/") + "/tts", timeout=5)
+        # Language parameters are included because api_v2.py raises a 500
+        # error (with a traceback in its log) when they are missing.
+        urllib.request.urlopen(api_url.rstrip("/") + "/tts?text_lang=zh&prompt_lang=zh", timeout=5)
     except urllib.error.HTTPError:
         return  # The server answered (400 for a request without parameters).
     except (urllib.error.URLError, OSError) as exc:

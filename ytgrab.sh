@@ -1615,7 +1615,7 @@ gpt_sovits_api_url() {
 
 gpt_sovits_is_running() {
   local code
-  code="$(curl -s -o /dev/null -m 5 -w '%{http_code}' "$(gpt_sovits_api_url)/tts" 2>/dev/null)" || true
+  code="$(curl -s -o /dev/null -m 5 -w '%{http_code}' "$(gpt_sovits_api_url)/tts?text_lang=zh&prompt_lang=zh" 2>/dev/null)" || true
   [ -n "$code" ] && [ "$code" != "000" ]
 }
 
