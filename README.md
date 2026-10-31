@@ -409,6 +409,26 @@ Then it offers two sources:
    Chinese captions. The video is downloaded as MP4 at the chosen quality.
 2. **Local files:** choose a video and a Chinese SRT, VTT or ASS file that is
    already synchronized with it.
+3. **Local English video without subtitles:** the speech is transcribed
+   locally, then translated with OpenAI (see below).
+
+### Videos without captions
+
+When a YouTube video has no usable captions, or with source 3, the script
+transcribes the English speech with [faster-whisper](https://github.com/SYSTRAN/faster-whisper)
+(MIT license), which is already installed in the GPT-SoVITS environment. It
+runs on your Mac, costs nothing, and downloads the `large-v3-turbo` model
+(about 1.6 GB) on first use; set `WHISPER_MODEL=small.en` for a faster, less
+accurate run. The recognized words are split into short subtitle lines, saved
+as `<title> [Whisper].en.srt`, and then translated into Simplified Chinese with
+OpenAI (same consent and API-key flow as option 4). Both SRT files are kept,
+and the dubbed MP4 gets the usual Chinese, English and Chinese-English
+subtitle tracks. `transcribe.py` can also be run by itself with the
+GPT-SoVITS Python:
+
+```bash
+~/path/to/envs/GPTSoVits/bin/python transcribe.py --video talk.mp4 --output talk.en.srt
+```
 
 Output names look like `Example Video [abc123] [zh-dub-female-03].mp4`.
 
