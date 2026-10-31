@@ -92,6 +92,23 @@ class TextAndTimingTests(unittest.TestCase):
         self.assertEqual([s.text for s in segments], ["今天我们学习网络。", "第二句", "很远的一句。"])
         self.assertEqual((segments[0].start_ms, segments[0].end_ms), (0, 2000))
 
+    def test_build_segments_skips_untranslated_english_cues(self) -> None:
+        segments = build_segments(
+            [
+                cue(0, 1000, "民调显示了什么？"),
+                cue(1000, 2000, "President Trump as he rallies"),
+                cue(2000, 3000, "So,"),
+                cue(3000, 4000, "使用 SQL 查询。"),
+            ]
+        )
+        self.assertEqual([s.text for s in segments], ["民调显示了什么？", "使用SQL查询。"])
+
+    def test_merging_does_not_add_stray_commas(self) -> None:
+        segments = build_segments(
+            [cue(0, 1000, "至少目前的民调——"), cue(1100, 2000, "记住，这只是快照"), cue(2100, 3000, "的结果。")]
+        )
+        self.assertEqual(segments[0].text, "至少目前的民调——记住，这只是快照的结果。")
+
     def test_build_segments_drops_repeated_rolling_captions_and_overlaps(self) -> None:
         segments = build_segments(
             [cue(0, 3000, "第一句。"), cue(1500, 3500, "第一句。"), cue(2500, 4000, "第二句。")]

@@ -401,7 +401,10 @@ Output names look like `Example Video [abc123] [zh-dub-female-03].mp4`.
 
 Short caption fragments that continue the same sentence are merged so the
 voice does not stop mid-sentence, and repeated rolling captions are spoken
-once. Each line may use the time until the next line begins; if it is still
+once. Lines with no Chinese characters (usually captions the translator left
+in English) are skipped. Every line is generated at GPT-SoVITS speed 1.1 with
+short pauses between phrases, because Chinese read aloud tends to run longer
+than the original speech. Each line may use the time until the next line begins; if it is still
 too long it is sped up by at most 1.35x, and any remaining overflow is absorbed
 at the next pause. Silence at the start and end of each generated line is
 trimmed.
@@ -411,7 +414,8 @@ M4 CPU, so a one-hour lecture can take 30 minutes or more). Every finished line
 is cached in the working folder. If the server stops, or fails three lines
 in a row with the same error (for example a missing Python module), the script
 offers to restart it and resume; finished lines are not generated again. Lines the server rejects are
-left silent and reported at the end.
+left silent and reported at the end, along with how far behind the original
+speech the voice ran at its worst.
 
 `dub_chinese.py` can also be used directly:
 
@@ -421,7 +425,8 @@ python3 dub_chinese.py --video lecture.mp4 --srt lecture.zh.srt \
 ```
 
 Rerunning the same command with the same `--workdir` resumes. Useful options:
-`--max-speed` (1.0-2.0), `--speed` (GPT-SoVITS speed for every line),
+`--max-speed` (1.0-2.0), `--speed` (GPT-SoVITS speed for every line, default
+1.1), `--pause` (seconds between phrases, default 0.1),
 `--seed` (fixed by default so the voice stays consistent), and
 `--no-embed-subtitle`.
 
