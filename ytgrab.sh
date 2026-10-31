@@ -28,6 +28,8 @@ DUB_VOICE_NAME=""
 DUB_WORKDIR=""
 DUB_VIDEO=""
 DUB_SUBTITLE=""
+DUB_ENGLISH_SUBTITLE=""
+ENGLISH_SUBTITLE_OUTPUT=""
 GPT_SOVITS_PID=""
 DUB_KEEP_BACKGROUND=0
 DUB_DEMUCS_PYTHON=""
@@ -304,6 +306,7 @@ translate_youtube_subtitles_with_openai() {
     echo "  $workdir"
     return 2
   fi
+  ENGLISH_SUBTITLE_OUTPUT="$source_output"
 
   output_base="${source_name%.srt}"
   output_base="${output_base%.*}"
@@ -1897,9 +1900,11 @@ prepare_youtube_dub_sources() {
   fi
   if [ "$subtitle_choice" = "1" ] && [ "$OPENAI_SUBTITLE_ENABLED" -eq 1 ]; then
     TRANSLATED_SUBTITLE_OUTPUT=""
+    ENGLISH_SUBTITLE_OUTPUT=""
     translate_youtube_subtitles_with_openai "zh-Hans"; status=$?
     if [ "$status" -eq 0 ]; then
       DUB_SUBTITLE="$TRANSLATED_SUBTITLE_OUTPUT"
+      DUB_ENGLISH_SUBTITLE="$ENGLISH_SUBTITLE_OUTPUT"
     elif [ "$status" -eq 1 ]; then
       download_youtube_chinese_subtitle || return 1
     else
@@ -1907,6 +1912,11 @@ prepare_youtube_dub_sources() {
     fi
   else
     download_youtube_chinese_subtitle || return 1
+    if download_english_subtitle_for_translation "$DUB_WORKDIR"; then
+      DUB_ENGLISH_SUBTITLE="$ENGLISH_SUBTITLE_FILE"
+    else
+      echo "No English captions were found; only the Chinese subtitle will be added."
+    fi
   fi
 
   if [ -z "$HEIGHT" ]; then
@@ -1928,8 +1938,25 @@ prepare_youtube_dub_sources() {
   return 1
 }
 
+# Print an SRT path for a local subtitle, converting VTT or ASS into the work dir.
+local_subtitle_as_srt() {
+  local subtitle="$1" name="$2" extension
+  extension="$(printf '%s' "${subtitle##*.}" | tr '[:upper:]' '[:lower:]')"
+  case "$extension" in
+    srt) printf '%s\n' "$subtitle" ;;
+    vtt|ass)
+      if ! ffmpeg -hide_banner -loglevel error -y -i "$subtitle" -map 0:s:0 -c:s srt "$DUB_WORKDIR/$name.srt"; then
+        echo "The subtitle could not be converted to SRT." >&2
+        return 1
+      fi
+      printf '%s\n' "$DUB_WORKDIR/$name.srt"
+      ;;
+    *) echo "Please choose an SRT, VTT or ASS subtitle." >&2; return 1 ;;
+  esac
+}
+
 prepare_local_dub_sources() {
-  local subtitle extension
+  local subtitle
   if ! need_command osascript; then
     echo "Choosing local files requires macOS Finder (osascript)."
     return 1
@@ -1938,25 +1965,20 @@ prepare_local_dub_sources() {
   subtitle="$(choose_finder_file "Choose the Chinese subtitle (SRT, VTT or ASS)")" || return 1
   DUB_WORKDIR="$(mktemp -d "$OUTDIR/ytgrab-dub-work.XXXXXX")" || return 1
 
-  extension="$(printf '%s' "${subtitle##*.}" | tr '[:upper:]' '[:lower:]')"
-  case "$extension" in
-    srt) DUB_SUBTITLE="$subtitle" ;;
-    vtt|ass)
-      DUB_SUBTITLE="$DUB_WORKDIR/chinese.srt"
-      if ! ffmpeg -hide_banner -loglevel error -y -i "$subtitle" -map 0:s:0 -c:s srt "$DUB_SUBTITLE"; then
-        echo "The subtitle could not be converted to SRT."
-        return 1
-      fi
-      ;;
-    *) echo "Please choose an SRT, VTT or ASS subtitle."; return 1 ;;
-  esac
+  DUB_SUBTITLE="$(local_subtitle_as_srt "$subtitle" chinese)" || return 1
+
+  echo
+  if ask_yes_no "Add an English subtitle as well (switchable, plus a Chinese-English track)?" "no"; then
+    subtitle="$(choose_finder_file "Choose the English subtitle (SRT, VTT or ASS)")" || return 0
+    DUB_ENGLISH_SUBTITLE="$(local_subtitle_as_srt "$subtitle" english)" || DUB_ENGLISH_SUBTITLE=""
+  fi
 }
 
 run_dub_workflow() {
   local source_choice base output number status failure_choice
-  local background_args=()
+  local extra_args=()
 
-  DUB_VOICE_DIR=""; DUB_VOICE_NAME=""; DUB_WORKDIR=""; DUB_VIDEO=""; DUB_SUBTITLE=""
+  DUB_VOICE_DIR=""; DUB_VOICE_NAME=""; DUB_WORKDIR=""; DUB_VIDEO=""; DUB_SUBTITLE=""; DUB_ENGLISH_SUBTITLE=""
   check_dub_dependencies || return 1
   choose_dub_voice || return 1
   choose_dub_background
@@ -1988,6 +2010,7 @@ run_dub_workflow() {
   echo
   echo "Video    : $DUB_VIDEO"
   echo "Subtitle : $DUB_SUBTITLE"
+  [ -n "$DUB_ENGLISH_SUBTITLE" ] && echo "English  : $DUB_ENGLISH_SUBTITLE"
   echo "Voice    : $DUB_VOICE_NAME"
   if [ "$DUB_KEEP_BACKGROUND" -eq 1 ]; then
     echo "Audio    : Chinese voice + original background"
@@ -1998,7 +2021,10 @@ run_dub_workflow() {
   echo "Long lectures take a while; finished lines are cached if you stop."
   echo
   if [ "$DUB_KEEP_BACKGROUND" -eq 1 ]; then
-    background_args=(--keep-background --demucs-python "$DUB_DEMUCS_PYTHON")
+    extra_args=(--keep-background --demucs-python "$DUB_DEMUCS_PYTHON")
+  fi
+  if [ -n "$DUB_ENGLISH_SUBTITLE" ]; then
+    extra_args+=(--english-srt "$DUB_ENGLISH_SUBTITLE")
   fi
   wait_for_gpt_sovits || return 1
 
@@ -2010,7 +2036,7 @@ run_dub_workflow() {
       --output "$output" \
       --workdir "$DUB_WORKDIR" \
       --api-url "$(gpt_sovits_api_url)" \
-      ${background_args[@]+"${background_args[@]}"}
+      ${extra_args[@]+"${extra_args[@]}"}
     status=$?
     [ "$status" -eq 0 ] && break
     [ "$status" -eq 3 ] || return 1

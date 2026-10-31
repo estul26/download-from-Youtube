@@ -50,6 +50,25 @@ class DubMenuTests(unittest.TestCase):
             self.assertIn("Please choose 1 through 2.", result.stdout)
             self.assertIn("picked=beta", result.stdout)
 
+    def test_local_subtitles_are_converted_to_srt(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            vtt = directory / "lecture.vtt"
+            vtt.write_text("WEBVTT\n\n00:00:01.000 --> 00:00:02.000\nHello\n", encoding="utf-8")
+            srt = directory / "lecture.srt"
+            srt.write_text("1\n00:00:01,000 --> 00:00:02,000\n你好\n", encoding="utf-8")
+            result = self.run_bash(
+                f'DUB_WORKDIR="$(mktemp -d)"; local_subtitle_as_srt "{srt}" chinese;'
+                f' converted="$(local_subtitle_as_srt "{vtt}" english)"; echo "$converted"; cat "$converted";'
+                f' local_subtitle_as_srt "{directory}/x.txt" bad; echo "status=$?"',
+                directory,
+            )
+            lines = result.stdout.splitlines()
+            self.assertEqual(lines[0], str(srt))
+            self.assertTrue(lines[1].endswith("/english.srt"))
+            self.assertIn("Hello", result.stdout)
+            self.assertIn("status=1", result.stdout)
+
     def test_server_check_detects_a_stopped_server(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             result = self.run_bash(

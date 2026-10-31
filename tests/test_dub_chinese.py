@@ -18,7 +18,7 @@ REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPOSITORY_ROOT))
 
 import dub_chinese  # noqa: E402
-from dub_chinese import Segment, build_segments, clean_text, plan_timeline  # noqa: E402
+from dub_chinese import Segment, bilingual_cues, build_segments, clean_text, plan_timeline, tidy_cues  # noqa: E402
 from subtitle_improver import Cue  # noqa: E402
 
 
@@ -129,6 +129,20 @@ class TextAndTimingTests(unittest.TestCase):
         self.assertEqual(placements[2].tempo, 1.0)
 
 
+class SubtitleTrackTests(unittest.TestCase):
+    def test_tidy_cues_removes_rolling_duplicates_and_overlaps(self) -> None:
+        tidy = tidy_cues([cue(0, 3000, "Hello"), cue(1000, 3500, "Hello"), cue(3000, 5000, "<i>world</i>"), cue(4000, 6000, " ")])
+        self.assertEqual(tidy, [(0, 3000, "Hello"), (3000, 5000, "world")])
+
+    def test_bilingual_pairs_by_largest_overlap(self) -> None:
+        chinese = [(0, 2000, "你好"), (2000, 4000, "世界"), (5000, 6000, "无对应")]
+        english = [(0, 1500, "Hello"), (1500, 3800, "the\nworld")]
+        self.assertEqual(
+            bilingual_cues(chinese, english),
+            [(0, 2000, "你好\nHello"), (2000, 4000, "世界\nthe world"), (5000, 6000, "无对应")],
+        )
+
+
 class EndToEndTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
@@ -211,6 +225,28 @@ class EndToEndTests(unittest.TestCase):
             arguments[arguments.index(str(output))] = str(directory / "again.mp4")
             self.assertEqual(dub_chinese.main(arguments), 0)
             self.assertEqual([request["text"] for request in FakeTTSHandler.requests], ["无法合成"])
+
+    def test_adds_english_and_bilingual_subtitle_tracks(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            video, srt, voice = self.make_inputs(directory)
+            english = directory / "lecture.en.srt"
+            english.write_text(
+                "1\n00:00:00,500 --> 00:00:03,500\nHello everyone, today we learn networking.\n\n"
+                "2\n00:00:06,000 --> 00:00:07,500\nThank you.\n",
+                encoding="utf-8",
+            )
+            output = directory / "subs.mp4"
+            code = dub_chinese.main([
+                "--video", str(video), "--srt", str(srt), "--voice", str(voice), "--output", str(output),
+                "--workdir", str(directory / "work"), "--api-url", self.api_url, "--english-srt", str(english),
+            ])
+            self.assertEqual(code, 0)
+            subtitles = [st for st in self.ffprobe_streams(output) if st["codec_type"] == "subtitle"]
+            self.assertEqual([st["tags"]["language"] for st in subtitles], ["chi", "eng", "chi"])
+            self.assertEqual(subtitles[2]["tags"]["handler_name"], "中英双语")
+            bilingual = (directory / "work" / "subtitle.zh-en.srt").read_text(encoding="utf-8")
+            self.assertIn("谢谢。\nThank you.", bilingual)
 
     def test_stops_when_the_server_fails_every_line_and_resumes_later(self) -> None:
         FakeTTSHandler.requests = []
