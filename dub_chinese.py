@@ -303,6 +303,81 @@ def write_track(clips: list[tuple[int, Path]], total_ms: int, output: Path) -> N
         pad_to(int(total_ms * SAMPLE_RATE / 1000))
 
 
+# ---------- Soft subtitle tracks ----------
+def tidy_cues(cues) -> list[tuple[int, int, str]]:
+    """Sort cues, drop empty and repeated rolling captions, and stop overlaps."""
+    items = sorted(
+        ((cue.start_ms, cue.end_ms, TAG_RE.sub("", cue.text).strip()) for cue in cues), key=lambda item: item[0]
+    )
+    tidy: list[list] = []
+    for start, end, text in items:
+        if not text:
+            continue
+        if tidy and tidy[-1][2] == text:
+            tidy[-1][1] = max(tidy[-1][1], end)
+            continue
+        if tidy and tidy[-1][1] > start:
+            tidy[-1][1] = start
+        tidy.append([start, end, text])
+    return [(start, end, text) for start, end, text in tidy if end > start]
+
+
+def format_srt_time(milliseconds: int) -> str:
+    hours, rest = divmod(milliseconds, 3_600_000)
+    minutes, rest = divmod(rest, 60_000)
+    seconds, millis = divmod(rest, 1000)
+    return f"{hours:02d}:{minutes:02d}:{seconds:02d},{millis:03d}"
+
+
+def write_srt(path: Path, cues: list[tuple[int, int, str]]) -> None:
+    blocks = [
+        f"{number}\n{format_srt_time(start)} --> {format_srt_time(end)}\n{text}"
+        for number, (start, end, text) in enumerate(cues, start=1)
+    ]
+    path.write_text("\n\n".join(blocks) + "\n", encoding="utf-8")
+
+
+def bilingual_cues(
+    chinese: list[tuple[int, int, str]], english: list[tuple[int, int, str]]
+) -> list[tuple[int, int, str]]:
+    """Pair each Chinese cue with the English cue it overlaps most."""
+    combined = []
+    for start, end, text in chinese:
+        best, best_overlap = "", 0
+        for e_start, e_end, e_text in english:
+            if e_start >= end:
+                break
+            overlap = min(end, e_end) - max(start, e_start)
+            if overlap > best_overlap:
+                best, best_overlap = e_text, overlap
+        english_line = " ".join(best.split())
+        combined.append((start, end, f"{text}\n{english_line}" if english_line else text))
+    return combined
+
+
+def subtitle_tracks(chinese_srt: Path, english_srt: Path | None, workdir: Path) -> list[tuple[Path, str, str]]:
+    """Build the soft subtitle tracks: Chinese, and with English also English and bilingual."""
+    chinese = tidy_cues(parse_srt(chinese_srt))
+    chinese_path = workdir / "subtitle.zh.srt"
+    write_srt(chinese_path, chinese)
+    tracks = [(chinese_path, "chi", "中文")]
+    if english_srt is None:
+        return tracks
+    try:
+        english = tidy_cues(parse_srt(english_srt))
+    except SubtitleError as exc:
+        print(f"English subtitle skipped: {exc}")
+        return tracks
+    if not english:
+        return tracks
+    english_path = workdir / "subtitle.en.srt"
+    write_srt(english_path, english)
+    both_path = workdir / "subtitle.zh-en.srt"
+    write_srt(both_path, bilingual_cues(chinese, english))
+    tracks += [(english_path, "eng", "English"), (both_path, "chi", "中英双语")]
+    return tracks
+
+
 def separate_background(video: Path, workdir: Path, python: str) -> Path:
     """Return a WAV of the original audio with the speech removed (Demucs).
 
@@ -352,7 +427,7 @@ def mux(
     video: Path,
     dub_track: Path,
     output: Path,
-    subtitle: Path | None,
+    subtitles: list[tuple[Path, str, str]],
     original_lang: str,
     voice_name: str,
     with_background: bool = False,
@@ -360,13 +435,13 @@ def mux(
     has_original_audio = bool(probe(video, "stream=codec_name", "a:0"))
     original_codec = probe(video, "stream=codec_name", "a:0")
     arguments = ["-i", str(video), "-i", str(dub_track)]
-    if subtitle:
-        arguments += ["-i", str(subtitle)]
+    for path, _, _ in subtitles:
+        arguments += ["-i", str(path)]
     arguments += ["-map", "0:v:0", "-map", "1:a:0"]
     if has_original_audio:
         arguments += ["-map", "0:a:0"]
-    if subtitle:
-        arguments += ["-map", "2:0"]
+    for number in range(len(subtitles)):
+        arguments += ["-map", f"{number + 2}:0"]
     arguments += ["-c:v", "copy", "-c:a:0", "aac", "-b:a:0", "128k"]
     arguments += ["-metadata:s:a:0", "language=chi", "-metadata:s:a:0", f"title=中文配音 ({voice_name}){' + 背景音' if with_background else ''}", "-metadata:s:a:0", f"handler_name=中文配音 ({voice_name}){' + 背景音' if with_background else ''}"]
     arguments += ["-disposition:a:0", "default"]
@@ -377,9 +452,12 @@ def mux(
             arguments += ["-c:a:1", "aac", "-b:a:1", "160k"]
         arguments += ["-metadata:s:a:1", f"language={original_lang}", "-metadata:s:a:1", "title=Original", "-metadata:s:a:1", "handler_name=Original"]
         arguments += ["-disposition:a:1", "0"]
-    if subtitle:
-        arguments += ["-c:s", "mov_text", "-metadata:s:s:0", "language=chi", "-metadata:s:s:0", "title=中文", "-metadata:s:s:0", "handler_name=中文"]
-        arguments += ["-disposition:s:0", "0"]
+    if subtitles:
+        arguments += ["-c:s", "mov_text"]
+    for number, (_, language, title) in enumerate(subtitles):
+        stream = f"s:s:{number}"
+        arguments += [f"-metadata:{stream}", f"language={language}", f"-metadata:{stream}", f"title={title}",
+                      f"-metadata:{stream}", f"handler_name={title}", f"-disposition:{stream[2:]}", "0"]
     partial = output.with_name(output.stem + ".partial.mp4")
     arguments += ["-movflags", "+faststart", str(partial)]
     run_ffmpeg(arguments)
@@ -490,8 +568,9 @@ def dub(args: argparse.Namespace) -> Path:
         mix_with_background(track, background, mixed, args.background_volume)
         track = mixed
     print("Writing the dual-audio MP4...")
+    subtitles = subtitle_tracks(args.srt, args.english_srt, args.workdir) if args.embed_subtitle else []
     mux(
-        video, track, output, args.srt if args.embed_subtitle else None, args.original_lang, voice.name,
+        video, track, output, subtitles, args.original_lang, voice.name,
         with_background=background is not None,
     )
     print(f"Done: {output}")
@@ -523,6 +602,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--pause", type=float, default=0.1, help="Pause in seconds between phrases inside a line.")
     parser.add_argument("--seed", type=int, default=1234, help="Fixed seed keeps the voice consistent.")
     parser.add_argument("--no-embed-subtitle", dest="embed_subtitle", action="store_false")
+    parser.add_argument(
+        "--english-srt", type=Path,
+        help="English subtitle to add as a switchable track, plus a Chinese-English track.",
+    )
     parser.add_argument(
         "--keep-background", action="store_true",
         help="Keep music and sound effects by removing the original speech with Demucs.",
