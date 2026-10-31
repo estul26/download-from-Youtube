@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import socket
 import subprocess
 import tempfile
 import unittest
@@ -65,6 +66,79 @@ class DubMenuTests(unittest.TestCase):
                 directory,
             )
             self.assertEqual(result.stdout.split(), ["keep", "keep"])
+
+
+FAKE_API = """
+import sys, time
+from http.server import BaseHTTPRequestHandler, HTTPServer
+time.sleep(1)  # pretend to load models
+port = int(sys.argv[sys.argv.index("-p") + 1])
+class Handler(BaseHTTPRequestHandler):
+    def log_message(self, *args):
+        pass
+    def do_GET(self):
+        self.send_response(400)
+        self.end_headers()
+HTTPServer(("127.0.0.1", port), Handler).serve_forever()
+"""
+
+
+def free_port() -> int:
+    with socket.socket() as sock:
+        sock.bind(("127.0.0.1", 0))
+        return sock.getsockname()[1]
+
+
+class AutoStartTests(unittest.TestCase):
+    def run_with_fake_server(self, program: str, api_source: str = FAKE_API) -> subprocess.CompletedProcess[str]:
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            server_dir = directory / "GPT-SoVITS"
+            server_dir.mkdir()
+            (server_dir / "api_v2.py").write_text(api_source, encoding="utf-8")
+            (directory / "home").mkdir()
+            environment = os.environ.copy()
+            environment.update(
+                {
+                    "HOME": str(directory / "home"),
+                    "TMPDIR": str(directory),
+                    "GPT_SOVITS_DIR": str(server_dir),
+                    "GPT_SOVITS_PYTHON": subprocess.check_output(["which", "python3"], text=True).strip(),
+                    "GPT_SOVITS_API_URL": f"http://127.0.0.1:{free_port()}",
+                    "GPT_SOVITS_START_TIMEOUT": "20",
+                }
+            )
+            return subprocess.run(
+                ["bash", "-c", f'source "{REPOSITORY_ROOT}/ytgrab.sh"; {program}'],
+                env=environment, text=True, capture_output=True, check=False, timeout=60,
+            )
+
+    def test_starts_waits_and_stops_the_server_it_started(self) -> None:
+        result = self.run_with_fake_server(
+            "start_gpt_sovits; pid=$GPT_SOVITS_PID; wait_for_gpt_sovits && echo READY;"
+            " stop_gpt_sovits_if_started; kill -0 $pid 2>/dev/null && echo ALIVE || echo GONE;"
+            ' gpt_sovits_is_running && echo UP || echo DOWN'
+        )
+        self.assertIn("READY", result.stdout)
+        self.assertIn("GONE", result.stdout)
+        self.assertIn("DOWN", result.stdout)
+
+    def test_exit_trap_stops_the_server(self) -> None:
+        result = self.run_with_fake_server(
+            "start_gpt_sovits; wait_for_gpt_sovits >/dev/null; echo PID=$GPT_SOVITS_PID; exit 0"
+        )
+        pid = int(result.stdout.split("PID=")[1].split()[0])
+        with self.assertRaises(ProcessLookupError):
+            os.kill(pid, 0)
+
+    def test_reports_log_when_the_server_crashes(self) -> None:
+        result = self.run_with_fake_server(
+            'start_gpt_sovits; wait_for_gpt_sovits < /dev/null; echo "status=$?"',
+            api_source="raise SystemExit('No module named resampy')",
+        )
+        self.assertIn("stopped while starting", result.stdout)
+        self.assertIn("No module named resampy", result.stdout)
+        self.assertIn("status=1", result.stdout)
 
 
 if __name__ == "__main__":

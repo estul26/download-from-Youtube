@@ -28,6 +28,8 @@ DUB_VOICE_NAME=""
 DUB_WORKDIR=""
 DUB_VIDEO=""
 DUB_SUBTITLE=""
+GPT_SOVITS_PID=""
+GPT_SOVITS_LOG=""
 
 LANG1_REQUEST=""
 LANG2_REQUEST=""
@@ -1619,12 +1621,124 @@ gpt_sovits_is_running() {
   [ -n "$code" ] && [ "$code" != "000" ]
 }
 
+locate_gpt_sovits_dir() {
+  local candidate
+  for candidate in "${GPT_SOVITS_DIR:-}" "$SCRIPT_DIR/../GPT-SoVITS" \
+      "$HOME/GPT-SoVITS" "$HOME/Downloads/github/GPT-SoVITS" "$HOME/Downloads/GPT-SoVITS"; do
+    if [ -n "$candidate" ] && [ -f "$candidate/api_v2.py" ]; then
+      (cd -- "$candidate" && pwd -P)
+      return 0
+    fi
+  done
+  return 1
+}
+
+locate_gpt_sovits_python() {
+  local env_name="${GPT_SOVITS_CONDA_ENV:-GPTSoVits}"
+  local base
+
+  if [ -n "${GPT_SOVITS_PYTHON:-}" ]; then
+    [ -x "$GPT_SOVITS_PYTHON" ] || return 1
+    printf '%s\n' "$GPT_SOVITS_PYTHON"
+    return 0
+  fi
+  if need_command conda; then
+    base="$(conda info --base 2>/dev/null)" || base=""
+    if [ -n "$base" ] && [ -x "$base/envs/$env_name/bin/python" ]; then
+      printf '%s\n' "$base/envs/$env_name/bin/python"
+      return 0
+    fi
+  fi
+  for base in /opt/homebrew/Caskroom/miniconda/base "$HOME/miniconda3" "$HOME/anaconda3" \
+      "$HOME/miniforge3" /opt/homebrew/anaconda3 /opt/miniconda3 /opt/anaconda3; do
+    if [ -x "$base/envs/$env_name/bin/python" ]; then
+      printf '%s\n' "$base/envs/$env_name/bin/python"
+      return 0
+    fi
+  done
+  return 1
+}
+
+gpt_sovits_api_is_local() {
+  case "$(gpt_sovits_api_url)" in
+    http://127.0.0.1:*|http://localhost:*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# Start GPT-SoVITS in the background when it is not already running. The
+# server is only stopped later if this script started it.
+start_gpt_sovits() {
+  local directory python port url
+
+  gpt_sovits_is_running && return 0
+  [ -n "$GPT_SOVITS_PID" ] && kill -0 "$GPT_SOVITS_PID" 2>/dev/null && return 0
+  gpt_sovits_api_is_local || return 1
+  directory="$(locate_gpt_sovits_dir)" || return 1
+  python="$(locate_gpt_sovits_python)" || return 1
+  url="$(gpt_sovits_api_url)"
+  port="${url##*:}"
+  port="${port%%/*}"
+
+  GPT_SOVITS_LOG="${TMPDIR:-/tmp}"
+  GPT_SOVITS_LOG="${GPT_SOVITS_LOG%/}/ytgrab-gpt-sovits.log"
+  echo
+  echo "Starting GPT-SoVITS in the background ($directory)..."
+  (cd -- "$directory" && exec "$python" api_v2.py -a 127.0.0.1 -p "$port") \
+    >"$GPT_SOVITS_LOG" 2>&1 &
+  GPT_SOVITS_PID=$!
+  trap 'stop_gpt_sovits_if_started' EXIT
+  trap 'echo; stop_gpt_sovits_if_started; [ -n "$DUB_WORKDIR" ] && [ -d "$DUB_WORKDIR" ] && echo "Working files were preserved at: $DUB_WORKDIR"; exit 130' INT TERM
+  return 0
+}
+
+stop_gpt_sovits_if_started() {
+  local waited=0
+  [ -n "$GPT_SOVITS_PID" ] || return 0
+  if kill -0 "$GPT_SOVITS_PID" 2>/dev/null; then
+    echo "Stopping GPT-SoVITS..."
+    kill "$GPT_SOVITS_PID" 2>/dev/null || true
+    while kill -0 "$GPT_SOVITS_PID" 2>/dev/null && [ "$waited" -lt 20 ]; do
+      sleep 0.5
+      waited=$((waited + 1))
+    done
+    kill -9 "$GPT_SOVITS_PID" 2>/dev/null || true
+  fi
+  wait "$GPT_SOVITS_PID" 2>/dev/null || true
+  GPT_SOVITS_PID=""
+}
+
 wait_for_gpt_sovits() {
-  local answer
+  local answer waited=0 limit="${GPT_SOVITS_START_TIMEOUT:-300}"
+
+  if [ -n "$GPT_SOVITS_PID" ] && ! gpt_sovits_is_running; then
+    printf 'Waiting for GPT-SoVITS to load its models'
+    while ! gpt_sovits_is_running; do
+      if ! kill -0 "$GPT_SOVITS_PID" 2>/dev/null; then
+        echo
+        echo "GPT-SoVITS stopped while starting. Last lines of $GPT_SOVITS_LOG:"
+        tail -n 15 "$GPT_SOVITS_LOG" 2>/dev/null | sed 's/^/  /'
+        GPT_SOVITS_PID=""
+        break
+      fi
+      if [ "$waited" -ge "$limit" ]; then
+        echo
+        echo "GPT-SoVITS did not answer within $limit seconds. Log: $GPT_SOVITS_LOG"
+        stop_gpt_sovits_if_started
+        break
+      fi
+      sleep 2
+      waited=$((waited + 2))
+      [ $((waited % 10)) -eq 0 ] && printf '.'
+    done
+    gpt_sovits_is_running && { echo " ready."; return 0; }
+  fi
+
   while ! gpt_sovits_is_running; do
     echo
-    echo "GPT-SoVITS is not running at $(gpt_sovits_api_url)."
-    echo "Start it in another Terminal window, for example:"
+    echo "GPT-SoVITS is not running at $(gpt_sovits_api_url) and could not be started automatically."
+    echo "Set GPT_SOVITS_DIR (the GPT-SoVITS folder) and GPT_SOVITS_CONDA_ENV (default GPTSoVits),"
+    echo "or start it yourself in another Terminal window:"
     echo "  cd ~/GPT-SoVITS && conda activate GPTSoVits && python api_v2.py -a 127.0.0.1 -p 9880"
     read -r -p "Press Enter to check again, or type q to cancel: " answer || return 1
     case "$answer" in q|Q) return 1 ;; esac
@@ -1646,7 +1760,7 @@ check_dub_dependencies() {
       return 1
     fi
   done
-  wait_for_gpt_sovits
+  start_gpt_sovits || true
 }
 
 list_dub_voices() {
@@ -1843,6 +1957,7 @@ run_dub_workflow() {
   echo "Work dir : $DUB_WORKDIR"
   echo "Long lectures take a while; finished lines are cached if you stop."
   echo
+  wait_for_gpt_sovits || return 1
 
   while true; do
     python3 "$SCRIPT_DIR/dub_chinese.py" \
@@ -1861,7 +1976,14 @@ run_dub_workflow() {
     while true; do
       read -r -p "Choose [1-2]: " failure_choice || return 1
       case "$failure_choice" in
-        1) wait_for_gpt_sovits || return 1; break ;;
+        1)
+          if [ -n "$GPT_SOVITS_PID" ]; then
+            stop_gpt_sovits_if_started
+            start_gpt_sovits || true
+          fi
+          wait_for_gpt_sovits || return 1
+          break
+          ;;
         2) return 1 ;;
         *) echo "Please choose 1 or 2." ;;
       esac
@@ -1870,6 +1992,7 @@ run_dub_workflow() {
 
   FINAL_OUTPUT="$output"
   cleanup_dub_workdir
+  stop_gpt_sovits_if_started
   return 0
 }
 
@@ -1900,6 +2023,7 @@ main() {
     run_dual_subtitle_workflow; STATUS=$?
   elif [ "$TYPE" = "6" ]; then
     run_dub_workflow; STATUS=$?
+    stop_gpt_sovits_if_started
   else
     run_standard_download "$TYPE"; STATUS=$?
   fi
