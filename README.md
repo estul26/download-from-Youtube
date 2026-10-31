@@ -329,9 +329,20 @@ Infuse can switch audio tracks; the Photos app may only play the first one.
 
 ### One-time setup
 
-1. Install GPT-SoVITS by following its README (macOS: conda with Python 3.10
-   or 3.11, then `bash install.sh --device MPS --source HF`). It is a large
-   install with several GB of models and is not managed by this script.
+1. Install GPT-SoVITS next to this repository (for example
+   `~/Downloads/github/GPT-SoVITS`). It is a large install with several GB of
+   models and is not managed by this script. Steps that worked on macOS:
+
+   ```bash
+   brew install wget
+   conda create -n GPTSoVits python=3.10 -y
+   conda activate GPTSoVits
+   bash install.sh --device MPS --source HF
+   pip install resampy   # missing from GPT-SoVITS's requirements at the time of writing
+   ```
+
+   If conda asks you to accept the Anaconda Terms of Service, run the two
+   `conda tos accept ...` commands it prints.
 2. Pick one or more free female reference voices:
 
    ```bash
@@ -358,15 +369,24 @@ Infuse can switch audio tracks; the Photos app may only play the first one.
 
 ### Each run
 
-Start the GPT-SoVITS API in a separate Terminal window and leave it open:
+Just run `./ytgrab.sh` and choose option 6. If GPT-SoVITS is not already
+running, the script starts it in the background so its models load while the
+video and captions download, waits until it answers, and stops it again when
+the run finishes, fails, or is cancelled with Ctrl-C. A server you started
+yourself is used as-is and left running. The server log is written to
+`$TMPDIR/ytgrab-gpt-sovits.log`.
+
+The script finds GPT-SoVITS in a `GPT-SoVITS` folder next to this repository,
+`~/GPT-SoVITS`, or `~/Downloads/github/GPT-SoVITS`, and its Python in the
+`GPTSoVits` conda environment. Override these if needed:
 
 ```bash
-cd ~/GPT-SoVITS && python api_v2.py -a 127.0.0.1 -p 9880
+export GPT_SOVITS_DIR=~/path/to/GPT-SoVITS
+export GPT_SOVITS_CONDA_ENV=GPTSoVits    # or GPT_SOVITS_PYTHON=/full/path/to/python
+export GPT_SOVITS_API_URL=http://127.0.0.1:9880
 ```
 
-Then run `./ytgrab.sh` and choose option 6. The script checks that the server
-answers (set `GPT_SOVITS_API_URL` if it runs elsewhere), asks for a voice, and
-offers two sources:
+After asking for a voice, option 6 offers two sources:
 
 1. **YouTube:** the Chinese text comes from the OpenAI translation of the
    English captions (same consent and API-key flow as option 4, and the
@@ -388,8 +408,9 @@ trimmed.
 
 Generation is slow on a Mac (GPT-SoVITS reports roughly half real time on an
 M4 CPU, so a one-hour lecture can take 30 minutes or more). Every finished line
-is cached in the working folder. If the server stops, the script offers to
-resume; finished lines are not generated again. Lines the server rejects are
+is cached in the working folder. If the server stops, or fails three lines
+in a row with the same error (for example a missing Python module), the script
+offers to restart it and resume; finished lines are not generated again. Lines the server rejects are
 left silent and reported at the end.
 
 `dub_chinese.py` can also be used directly:
