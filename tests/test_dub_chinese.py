@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import io
 import json
+import os
 import math
 import struct
 import subprocess
@@ -236,6 +237,64 @@ class EndToEndTests(unittest.TestCase):
             FakeTTSHandler.requests = []
             self.assertEqual(dub_chinese.main(arguments), 0)
             self.assertEqual(len(FakeTTSHandler.requests), 5)
+
+    def test_keeps_background_with_demucs(self) -> None:
+        FakeTTSHandler.requests = []
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            video, srt, voice = self.make_inputs(directory)
+            # A stand-in "demucs" package: writes a quiet 300 Hz tone as no_vocals.wav.
+            package = directory / "fake_modules" / "demucs"
+            package.mkdir(parents=True)
+            (package / "__init__.py").write_text("", encoding="utf-8")
+            (package / "__main__.py").write_text(
+                "import sys, subprocess\n"
+                "from pathlib import Path\n"
+                "args = sys.argv[1:]\n"
+                "out = Path(args[args.index('-o') + 1]) / 'htdemucs'\n"
+                "out.mkdir(parents=True, exist_ok=True)\n"
+                "subprocess.run(['ffmpeg', '-loglevel', 'error', '-y', '-f', 'lavfi', '-i',\n"
+                "    'sine=frequency=300:duration=8', '-ac', '2', str(out / 'no_vocals.wav')], check=True)\n",
+                encoding="utf-8",
+            )
+            output = directory / "with-bg.mp4"
+            work = directory / "work"
+            arguments = [
+                "--video", str(video), "--srt", str(srt), "--voice", str(voice), "--output", str(output),
+                "--workdir", str(work), "--api-url", self.api_url, "--keep-background",
+                "--demucs-python", sys.executable,
+            ]
+            old_path = os.environ.get("PYTHONPATH")
+            os.environ["PYTHONPATH"] = str(directory / "fake_modules")
+            try:
+                self.assertEqual(dub_chinese.main(arguments), 0)
+            finally:
+                if old_path is None:
+                    os.environ.pop("PYTHONPATH", None)
+                else:
+                    os.environ["PYTHONPATH"] = old_path
+
+            self.assertTrue((work / "background.wav").is_file())
+            with wave.open(str(work / "chinese_mix.wav"), "rb") as mixed:
+                self.assertEqual(mixed.getnchannels(), 2)
+                rate = mixed.getframerate()
+                mixed.setpos(int(4.3 * rate))  # the rejected line: no voice here, only background
+                frames = mixed.readframes(int(0.2 * rate))
+            samples = struct.unpack(f"<{len(frames) // 2}h", frames)
+            self.assertGreater(max(abs(value) for value in samples), 1000)
+            audio = [st for st in self.ffprobe_streams(output) if st["codec_type"] == "audio"]
+            self.assertIn("背景音", audio[0]["tags"].get("title") or audio[0]["tags"].get("handler_name", ""))
+
+    def test_keep_background_explains_missing_demucs(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            video, srt, voice = self.make_inputs(directory)
+            code = dub_chinese.main([
+                "--video", str(video), "--srt", str(srt), "--voice", str(voice),
+                "--output", str(directory / "x.mp4"), "--workdir", str(directory / "w"),
+                "--api-url", self.api_url, "--keep-background", "--demucs-python", sys.executable,
+            ])
+            self.assertEqual(code, 1)
 
     def test_refuses_to_overwrite_and_reports_unreachable_server(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

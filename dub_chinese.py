@@ -303,6 +303,51 @@ def write_track(clips: list[tuple[int, Path]], total_ms: int, output: Path) -> N
         pad_to(int(total_ms * SAMPLE_RATE / 1000))
 
 
+def separate_background(video: Path, workdir: Path, python: str) -> Path:
+    """Return a WAV of the original audio with the speech removed (Demucs).
+
+    The result is cached in the working folder, so resuming skips this step.
+    """
+    target = workdir / "background.wav"
+    if target.exists():
+        return target
+    check = subprocess.run([python, "-c", "import demucs"], capture_output=True, text=True)
+    if check.returncode != 0:
+        raise DubError(
+            "Keeping background music needs Demucs in the GPT-SoVITS Python environment. Install it with:\n"
+            f"  {python} -m pip install demucs"
+        )
+    original = workdir / "original_audio.wav"
+    run_ffmpeg(["-i", str(video), "-vn", "-ac", "2", "-ar", "44100", "-c:a", "pcm_s16le", str(original)])
+    separated = workdir / "separated"
+    print("Separating speech from background music with Demucs (first use downloads its model)...")
+    result = subprocess.run(
+        [python, "-m", "demucs", "--two-stems", "vocals", "-o", str(separated),
+         "--filename", "{stem}.{ext}", str(original)],
+        check=False,
+    )
+    found = sorted(separated.glob("*/no_vocals.wav"))
+    if result.returncode != 0 or not found:
+        raise DubError("Demucs could not separate the background audio.")
+    found[0].replace(target)
+    shutil.rmtree(separated, ignore_errors=True)
+    original.unlink(missing_ok=True)
+    return target
+
+
+def mix_with_background(voice_track: Path, background: Path, output: Path, background_volume: float) -> None:
+    """Mix the Chinese voice over the background into one stereo WAV."""
+    graph = (
+        f"[0:a]aformat=channel_layouts=stereo,aresample={SAMPLE_RATE}[voice];"
+        f"[1:a]aresample={SAMPLE_RATE},aformat=channel_layouts=stereo,volume={background_volume:.2f}[bed];"
+        "[voice][bed]amix=inputs=2:duration=first:normalize=0,alimiter=limit=0.95[out]"
+    )
+    temporary = output.with_suffix(".tmp.wav")
+    run_ffmpeg(["-i", str(voice_track), "-i", str(background), "-filter_complex", graph,
+                "-map", "[out]", "-c:a", "pcm_s16le", str(temporary)])
+    temporary.replace(output)
+
+
 def mux(
     video: Path,
     dub_track: Path,
@@ -310,6 +355,7 @@ def mux(
     subtitle: Path | None,
     original_lang: str,
     voice_name: str,
+    with_background: bool = False,
 ) -> None:
     has_original_audio = bool(probe(video, "stream=codec_name", "a:0"))
     original_codec = probe(video, "stream=codec_name", "a:0")
@@ -322,17 +368,17 @@ def mux(
     if subtitle:
         arguments += ["-map", "2:0"]
     arguments += ["-c:v", "copy", "-c:a:0", "aac", "-b:a:0", "128k"]
-    arguments += ["-metadata:s:a:0", "language=chi", "-metadata:s:a:0", f"title=中文配音 ({voice_name})"]
+    arguments += ["-metadata:s:a:0", "language=chi", "-metadata:s:a:0", f"title=中文配音 ({voice_name}){' + 背景音' if with_background else ''}", "-metadata:s:a:0", f"handler_name=中文配音 ({voice_name}){' + 背景音' if with_background else ''}"]
     arguments += ["-disposition:a:0", "default"]
     if has_original_audio:
         if original_codec == "aac":
             arguments += ["-c:a:1", "copy"]
         else:
             arguments += ["-c:a:1", "aac", "-b:a:1", "160k"]
-        arguments += ["-metadata:s:a:1", f"language={original_lang}", "-metadata:s:a:1", "title=Original"]
+        arguments += ["-metadata:s:a:1", f"language={original_lang}", "-metadata:s:a:1", "title=Original", "-metadata:s:a:1", "handler_name=Original"]
         arguments += ["-disposition:a:1", "0"]
     if subtitle:
-        arguments += ["-c:s", "mov_text", "-metadata:s:s:0", "language=chi", "-metadata:s:s:0", "title=中文"]
+        arguments += ["-c:s", "mov_text", "-metadata:s:s:0", "language=chi", "-metadata:s:s:0", "title=中文", "-metadata:s:s:0", "handler_name=中文"]
         arguments += ["-disposition:s:0", "0"]
     partial = output.with_name(output.stem + ".partial.mp4")
     arguments += ["-movflags", "+faststart", str(partial)]
@@ -364,6 +410,11 @@ def dub(args: argparse.Namespace) -> Path:
     if not segments:
         raise DubError("The subtitle file has no speakable lines.")
     total_ms = media_duration_ms(video)
+    args.workdir.mkdir(parents=True, exist_ok=True)
+    background = None
+    if args.keep_background:
+        # Runs before synthesis so Demucs and GPT-SoVITS never compete for the CPU/GPU.
+        background = separate_background(video, args.workdir, args.demucs_python)
     check_server(args.api_url)
 
     clips_dir: Path = args.workdir / "clips"
@@ -433,8 +484,16 @@ def dub(args: argparse.Namespace) -> Path:
     track = args.workdir / "chinese_track.wav"
     print("Building the Chinese audio track...")
     write_track(placed, total_ms, track)
+    if background is not None:
+        print("Mixing the Chinese voice over the background audio...")
+        mixed = args.workdir / "chinese_mix.wav"
+        mix_with_background(track, background, mixed, args.background_volume)
+        track = mixed
     print("Writing the dual-audio MP4...")
-    mux(video, track, output, args.srt if args.embed_subtitle else None, args.original_lang, voice.name)
+    mux(
+        video, track, output, args.srt if args.embed_subtitle else None, args.original_lang, voice.name,
+        with_background=background is not None,
+    )
     print(f"Done: {output}")
     lags = [placement.start_ms - segment.start_ms for (segment, _), placement in zip(usable, placements)]
     late = sum(1 for lag in lags if lag > 500)
@@ -464,6 +523,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--pause", type=float, default=0.1, help="Pause in seconds between phrases inside a line.")
     parser.add_argument("--seed", type=int, default=1234, help="Fixed seed keeps the voice consistent.")
     parser.add_argument("--no-embed-subtitle", dest="embed_subtitle", action="store_false")
+    parser.add_argument(
+        "--keep-background", action="store_true",
+        help="Keep music and sound effects by removing the original speech with Demucs.",
+    )
+    parser.add_argument(
+        "--demucs-python", default=os.environ.get("DEMUCS_PYTHON", sys.executable),
+        help="Python that has Demucs installed (ytgrab.sh passes the GPT-SoVITS one).",
+    )
+    parser.add_argument("--background-volume", type=float, default=0.9, help="Background level, 0-2 (default 0.9).")
     args = parser.parse_args(argv)
     if not 1.0 <= args.max_speed <= 2.0:
         parser.error("--max-speed must be between 1.0 and 2.0")

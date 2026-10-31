@@ -89,6 +89,39 @@ def free_port() -> int:
         return sock.getsockname()[1]
 
 
+class BackgroundChoiceTests(unittest.TestCase):
+    def choose(self, answers: str, with_demucs: bool) -> str:
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            (directory / "home").mkdir()
+            environment = os.environ.copy()
+            environment["HOME"] = str(directory / "home")
+            environment["GPT_SOVITS_PYTHON"] = subprocess.check_output(["which", "python3"], text=True).strip()
+            if with_demucs:
+                (directory / "demucs").mkdir()
+                (directory / "demucs" / "__init__.py").write_text("", encoding="utf-8")
+                environment["PYTHONPATH"] = str(directory)
+            result = subprocess.run(
+                ["bash", "-c", f'source "{REPOSITORY_ROOT}/ytgrab.sh"; choose_dub_background;'
+                 ' echo "keep=$DUB_KEEP_BACKGROUND python=$DUB_DEMUCS_PYTHON"'],
+                env=environment, input=answers, text=True, capture_output=True, check=False,
+            )
+            return result.stdout
+
+    def test_default_yes_keeps_background_when_demucs_is_available(self) -> None:
+        output = self.choose("\n", with_demucs=True)
+        self.assertIn("keep=1 python=/", output)
+
+    def test_no_means_voice_only(self) -> None:
+        self.assertIn("keep=0", self.choose("n\n", with_demucs=True))
+
+    def test_declining_the_install_continues_with_voice_only(self) -> None:
+        output = self.choose("y\nn\n", with_demucs=False)
+        self.assertIn("Demucs is not installed", output)
+        self.assertIn("Continuing with voice only.", output)
+        self.assertIn("keep=0", output)
+
+
 class AutoStartTests(unittest.TestCase):
     def run_with_fake_server(self, program: str, api_source: str = FAKE_API) -> subprocess.CompletedProcess[str]:
         with tempfile.TemporaryDirectory() as temporary:

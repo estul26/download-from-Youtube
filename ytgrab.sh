@@ -29,6 +29,8 @@ DUB_WORKDIR=""
 DUB_VIDEO=""
 DUB_SUBTITLE=""
 GPT_SOVITS_PID=""
+DUB_KEEP_BACKGROUND=0
+DUB_DEMUCS_PYTHON=""
 GPT_SOVITS_LOG=""
 
 LANG1_REQUEST=""
@@ -1809,6 +1811,37 @@ choose_dub_voice() {
   done
 }
 
+# Ask whether to keep music and sound effects. This needs Demucs in the
+# GPT-SoVITS Python environment; offer to install it there once.
+choose_dub_background() {
+  local python
+
+  DUB_KEEP_BACKGROUND=0
+  DUB_DEMUCS_PYTHON=""
+  echo
+  ask_yes_no "Keep background music and sounds? (removes the original speech with Demucs; slower)" "yes" || return 0
+
+  python="$(locate_gpt_sovits_python)" || python=""
+  if [ -z "$python" ]; then
+    echo "The GPT-SoVITS Python environment was not found; continuing with voice only."
+    return 0
+  fi
+  if ! "$python" -c "import demucs" >/dev/null 2>&1; then
+    echo
+    echo "Demucs is not installed in the GPT-SoVITS environment ($python)."
+    if ! ask_yes_no "Install it now with pip (about 100 MB including its model)?" "yes"; then
+      echo "Continuing with voice only."
+      return 0
+    fi
+    if ! "$python" -m pip install demucs; then
+      echo "Demucs could not be installed; continuing with voice only."
+      return 0
+    fi
+  fi
+  DUB_KEEP_BACKGROUND=1
+  DUB_DEMUCS_PYTHON="$python"
+}
+
 dub_workdir_path_is_safe() {
   case "$1" in
     "$OUTDIR"/ytgrab-dub-work.*) [ -d "$1" ] ;;
@@ -1921,10 +1954,12 @@ prepare_local_dub_sources() {
 
 run_dub_workflow() {
   local source_choice base output number status failure_choice
+  local background_args=()
 
   DUB_VOICE_DIR=""; DUB_VOICE_NAME=""; DUB_WORKDIR=""; DUB_VIDEO=""; DUB_SUBTITLE=""
   check_dub_dependencies || return 1
   choose_dub_voice || return 1
+  choose_dub_background
 
   echo
   echo "Choose source for the Chinese-dubbed video:"
@@ -1954,9 +1989,17 @@ run_dub_workflow() {
   echo "Video    : $DUB_VIDEO"
   echo "Subtitle : $DUB_SUBTITLE"
   echo "Voice    : $DUB_VOICE_NAME"
+  if [ "$DUB_KEEP_BACKGROUND" -eq 1 ]; then
+    echo "Audio    : Chinese voice + original background"
+  else
+    echo "Audio    : Chinese voice only"
+  fi
   echo "Work dir : $DUB_WORKDIR"
   echo "Long lectures take a while; finished lines are cached if you stop."
   echo
+  if [ "$DUB_KEEP_BACKGROUND" -eq 1 ]; then
+    background_args=(--keep-background --demucs-python "$DUB_DEMUCS_PYTHON")
+  fi
   wait_for_gpt_sovits || return 1
 
   while true; do
@@ -1966,7 +2009,8 @@ run_dub_workflow() {
       --voice "$DUB_VOICE_DIR" \
       --output "$output" \
       --workdir "$DUB_WORKDIR" \
-      --api-url "$(gpt_sovits_api_url)"
+      --api-url "$(gpt_sovits_api_url)" \
+      ${background_args[@]+"${background_args[@]}"}
     status=$?
     [ "$status" -eq 0 ] && break
     [ "$status" -eq 3 ] || return 1
