@@ -44,6 +44,7 @@ SAME_FAILURE_LIMIT = 3
 TAG_RE = re.compile(r"<[^>]+>|\{\\[^}]*\}")
 ANNOTATION_RE = re.compile(r"\[[^\]]*\]|【[^】]*】|♪+")
 SPEAKABLE_RE = re.compile(r"[\w一-鿿]")
+CJK_RE = re.compile(r"[\u4e00-\u9fff]")
 
 
 class DubError(RuntimeError):
@@ -91,13 +92,15 @@ def build_segments(cues) -> list[Segment]:
 
     Short cues that continue the same sentence are merged so the voice does not
     stop mid-sentence, which is common with YouTube's rolling captions.
-    Overlapping cues are clipped so segments never overlap.
+    Overlapping cues are clipped so segments never overlap. Cues without any
+    Chinese characters are left out: they are usually lines the translator
+    left in English, which a Chinese voice reads badly.
     """
     items = sorted(
         ((cue.start_ms, cue.end_ms, clean_text(cue.text)) for cue in cues),
         key=lambda item: item[0],
     )
-    items = [item for item in items if item[2]]
+    items = [item for item in items if CJK_RE.search(item[2])]
     merged: list[list] = []
     for start, end, text in items:
         if merged:
@@ -109,7 +112,7 @@ def build_segments(cues) -> list[Segment]:
             close = start - previous[1] <= MERGE_MAX_GAP_MS
             fits = end - previous[0] <= MERGE_MAX_SPAN_MS and len(previous[2]) + len(text) <= MERGE_MAX_CHARS
             if continues and close and fits:
-                joiner = "" if re.search(r"[一-鿿，、]$", previous[2]) else "，"
+                joiner = ""
                 if re.match(r"[a-zA-Z0-9]", text) and re.search(r"[a-zA-Z0-9]$", previous[2]):
                     joiner = " "
                 previous[1] = max(previous[1], end)
@@ -179,7 +182,7 @@ def check_server(api_url: str) -> None:
         ) from exc
 
 
-def tts_payload(text: str, voice: Voice, seed: int, speed: float) -> dict:
+def tts_payload(text: str, voice: Voice, seed: int, speed: float, pause: float = 0.1) -> dict:
     return {
         "text": text,
         "text_lang": "zh",
@@ -191,6 +194,7 @@ def tts_payload(text: str, voice: Voice, seed: int, speed: float) -> dict:
         "media_type": "wav",
         "streaming_mode": False,
         "speed_factor": speed,
+        "fragment_interval": pause,
         "seed": seed,
     }
 
@@ -337,9 +341,9 @@ def mux(
 
 
 # ---------- Main workflow ----------
-def clip_key(text: str, voice: Voice, seed: int, speed: float) -> str:
+def clip_key(text: str, voice: Voice, seed: int, speed: float, pause: float) -> str:
     material = json.dumps(
-        [text, voice.name, voice.prompt_text, str(voice.ref_audio), seed, speed], ensure_ascii=False
+        [text, voice.name, voice.prompt_text, str(voice.ref_audio), seed, speed, pause], ensure_ascii=False
     )
     return hashlib.sha1(material.encode("utf-8")).hexdigest()[:12]
 
@@ -371,14 +375,14 @@ def dub(args: argparse.Namespace) -> Path:
     done_new = 0
     print(f"Voice: {voice.name}  |  {len(segments)} lines  |  server {args.api_url}")
     for segment in segments:
-        key = clip_key(segment.text, voice, args.seed, args.speed)
+        key = clip_key(segment.text, voice, args.seed, args.speed, args.pause)
         final = clips_dir / f"{segment.index:05d}_{key}.wav"
         label = f"[{segment.index + 1}/{len(segments)}]"
         if final.exists():
             normalized.append(final)
             continue
         try:
-            data = synthesize(args.api_url, tts_payload(segment.text, voice, args.seed, args.speed))
+            data = synthesize(args.api_url, tts_payload(segment.text, voice, args.seed, args.speed, args.pause))
         except ServerUnavailable:
             raise
         except DubError as exc:
@@ -432,8 +436,15 @@ def dub(args: argparse.Namespace) -> Path:
     print("Writing the dual-audio MP4...")
     mux(video, track, output, args.srt if args.embed_subtitle else None, args.original_lang, voice.name)
     print(f"Done: {output}")
-    if sped_up:
-        print(f"{sped_up} line(s) were sped up to fit the original timing (max {args.max_speed}x).")
+    lags = [placement.start_ms - segment.start_ms for (segment, _), placement in zip(usable, placements)]
+    late = sum(1 for lag in lags if lag > 500)
+    print(f"{len(usable)} line(s) placed; {sped_up} sped up (max {args.max_speed}x).")
+    if late:
+        print(
+            f"{late} line(s) started more than 0.5 s after the original speech "
+            f"(at most {max(lags) / 1000:.1f} s). Fast speakers can be tighter with "
+            "--speed 1.2 or --max-speed 1.5."
+        )
     if skipped:
         print(f"{skipped} line(s) could not be synthesized and are silent.")
     return output
@@ -449,7 +460,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--api-url", default=DEFAULT_API_URL)
     parser.add_argument("--original-lang", default="eng", help="ISO 639-2 code of the original audio (default eng).")
     parser.add_argument("--max-speed", type=float, default=1.35, help="Largest speed-up used to fit timing.")
-    parser.add_argument("--speed", type=float, default=1.0, help="GPT-SoVITS speed_factor for every line.")
+    parser.add_argument("--speed", type=float, default=1.1, help="GPT-SoVITS speed_factor for every line (default 1.1).")
+    parser.add_argument("--pause", type=float, default=0.1, help="Pause in seconds between phrases inside a line.")
     parser.add_argument("--seed", type=int, default=1234, help="Fixed seed keeps the voice consistent.")
     parser.add_argument("--no-embed-subtitle", dest="embed_subtitle", action="store_false")
     args = parser.parse_args(argv)
