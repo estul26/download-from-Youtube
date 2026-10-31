@@ -42,8 +42,8 @@ except ImportError:  # pragma: no cover - exercised only without numpy
 SCRIPT_DIR = Path(__file__).resolve().parent
 DEFAULT_VOICES_DIR = SCRIPT_DIR / "voices"
 DEFAULT_URLS = (
-    "https://us.openslr.org/resources/93/data_aishell3.tgz",
     "https://openslr.elda.org/resources/93/data_aishell3.tgz",
+    "https://us.openslr.org/resources/93/data_aishell3.tgz",
     "https://openslr.trmal.net/resources/93/data_aishell3.tgz",
 )
 SOURCE_PAGE = "https://www.openslr.org/93/"
