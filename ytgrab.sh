@@ -22,6 +22,12 @@ OPENAI_SUBTITLE_ENABLED=0
 OPENAI_RUNTIME_API_KEY=""
 UNIQUE_SRT_PATH=""
 ENGLISH_SUBTITLE_FILE=""
+TRANSLATED_SUBTITLE_OUTPUT=""
+DUB_VOICE_DIR=""
+DUB_VOICE_NAME=""
+DUB_WORKDIR=""
+DUB_VIDEO=""
+DUB_SUBTITLE=""
 
 LANG1_REQUEST=""
 LANG2_REQUEST=""
@@ -341,6 +347,7 @@ translate_youtube_subtitles_with_openai() {
     return 2
   fi
   cleanup_subtitle_workdir "$workdir" || true
+  TRANSLATED_SUBTITLE_OUTPUT="$translated_output"
   echo
   echo "English SRT   : $source_output"
   echo "Translated SRT: $translated_output"
@@ -1601,6 +1608,271 @@ run_dual_subtitle_workflow() {
   return 0
 }
 
+# ---------- Chinese dubbing with GPT-SoVITS ----------
+gpt_sovits_api_url() {
+  printf '%s' "${GPT_SOVITS_API_URL:-http://127.0.0.1:9880}"
+}
+
+gpt_sovits_is_running() {
+  local code
+  code="$(curl -s -o /dev/null -m 5 -w '%{http_code}' "$(gpt_sovits_api_url)/tts" 2>/dev/null)" || true
+  [ -n "$code" ] && [ "$code" != "000" ]
+}
+
+wait_for_gpt_sovits() {
+  local answer
+  while ! gpt_sovits_is_running; do
+    echo
+    echo "GPT-SoVITS is not running at $(gpt_sovits_api_url)."
+    echo "Start it in another Terminal window, for example:"
+    echo "  cd ~/GPT-SoVITS && conda activate GPTSoVits && python api_v2.py -a 127.0.0.1 -p 9880"
+    read -r -p "Press Enter to check again, or type q to cancel: " answer || return 1
+    case "$answer" in q|Q) return 1 ;; esac
+  done
+}
+
+check_dub_dependencies() {
+  local tool
+  check_standard_dependencies || return 1
+  for tool in python3 ffprobe curl; do
+    if ! need_command "$tool"; then
+      echo "$tool is required for Chinese dubbing."
+      return 1
+    fi
+  done
+  for tool in dub_chinese.py subtitle_improver.py; do
+    if [ ! -f "$SCRIPT_DIR/$tool" ]; then
+      echo "Could not find $tool beside ytgrab.sh."
+      return 1
+    fi
+  done
+  wait_for_gpt_sovits
+}
+
+list_dub_voices() {
+  local directory
+  for directory in "$SCRIPT_DIR"/voices/*/; do
+    directory="${directory%/}"
+    case "$(basename "$directory")" in _*) continue ;; esac
+    [ -f "$directory/voice.json" ] && printf '%s\n' "$directory"
+  done
+}
+
+choose_dub_voice() {
+  local voices=() line choice
+  while IFS= read -r line; do
+    voices+=("$line")
+  done < <(list_dub_voices)
+
+  if [ "${#voices[@]}" -eq 0 ]; then
+    echo
+    echo "No voices found in $SCRIPT_DIR/voices."
+    echo "Pick free female voices from AISHELL-3 first:"
+    echo "  python3 \"$SCRIPT_DIR/fetch_voices.py\""
+    return 1
+  fi
+  if [ "${#voices[@]}" -eq 1 ]; then
+    DUB_VOICE_DIR="${voices[0]}"
+    DUB_VOICE_NAME="$(basename "$DUB_VOICE_DIR")"
+    echo
+    echo "Voice: $DUB_VOICE_NAME"
+    return 0
+  fi
+
+  echo
+  echo "Choose a Chinese voice:"
+  for choice in "${!voices[@]}"; do
+    echo "  $((choice + 1))) $(basename "${voices[$choice]}")"
+  done
+  while true; do
+    read -r -p "Voice [1-${#voices[@]}]: " choice || return 1
+    if [[ "$choice" =~ ^[0-9]+$ ]] && [ "$choice" -ge 1 ] && [ "$choice" -le "${#voices[@]}" ]; then
+      DUB_VOICE_DIR="${voices[$((choice - 1))]}"
+      DUB_VOICE_NAME="$(basename "$DUB_VOICE_DIR")"
+      return 0
+    fi
+    echo "Please choose 1 through ${#voices[@]}."
+  done
+}
+
+dub_workdir_path_is_safe() {
+  case "$1" in
+    "$OUTDIR"/ytgrab-dub-work.*) [ -d "$1" ] ;;
+    *) return 1 ;;
+  esac
+}
+
+cleanup_dub_workdir() {
+  if [ -n "$DUB_WORKDIR" ] && dub_workdir_path_is_safe "$DUB_WORKDIR"; then
+    rm -rf -- "$DUB_WORKDIR"
+  fi
+  DUB_WORKDIR=""
+}
+
+download_youtube_chinese_subtitle() {
+  local candidate
+  echo
+  echo "Downloading YouTube's Simplified Chinese captions..."
+  yt-dlp --cookies-from-browser "$BROWSER" --no-playlist --newline \
+    --skip-download --write-subs --write-auto-subs \
+    --sub-langs "zh-Hans" --sub-format "srt/best" --convert-subs srt \
+    -o "subtitle:$DUB_WORKDIR/%(title)s [%(id)s].%(ext)s" "$URL" || true
+  for candidate in "$DUB_WORKDIR"/*.zh-Hans.srt; do
+    [ -f "$candidate" ] || continue
+    DUB_SUBTITLE="$candidate"
+    return 0
+  done
+  echo "YouTube has no Simplified Chinese captions for this video."
+  return 1
+}
+
+prepare_youtube_dub_sources() {
+  local subtitle_choice format candidate status
+
+  prompt_url
+  echo
+  echo "Where should the Chinese text come from?"
+  echo "  1) OpenAI translation of the English captions (recommended)"
+  echo "  2) YouTube's Simplified Chinese captions (machine translation)"
+  while true; do
+    read -r -p "Choose [1-2]: " subtitle_choice || return 1
+    case "$subtitle_choice" in 1|2) break ;; *) echo "Please choose 1 or 2." ;; esac
+  done
+  choose_video_quality
+
+  DUB_WORKDIR="$(mktemp -d "$OUTDIR/ytgrab-dub-work.XXXXXX")" || {
+    echo "Could not create a working directory in $OUTDIR."
+    return 1
+  }
+
+  if [ "$subtitle_choice" = "1" ]; then
+    configure_openai_subtitle_use "translate" "Simplified Chinese (zh-Hans)"
+  fi
+  if [ "$subtitle_choice" = "1" ] && [ "$OPENAI_SUBTITLE_ENABLED" -eq 1 ]; then
+    TRANSLATED_SUBTITLE_OUTPUT=""
+    translate_youtube_subtitles_with_openai "zh-Hans"; status=$?
+    if [ "$status" -eq 0 ]; then
+      DUB_SUBTITLE="$TRANSLATED_SUBTITLE_OUTPUT"
+    elif [ "$status" -eq 1 ]; then
+      download_youtube_chinese_subtitle || return 1
+    else
+      return 1
+    fi
+  else
+    download_youtube_chinese_subtitle || return 1
+  fi
+
+  if [ -z "$HEIGHT" ]; then
+    format='bv*[ext=mp4]+ba[ext=m4a]/b[ext=mp4]/bv*+ba/b'
+  else
+    format="bv*[ext=mp4][height<=${HEIGHT}]+ba[ext=m4a]/b[ext=mp4][height<=${HEIGHT}]/bv*[height<=${HEIGHT}]+ba/b[height<=${HEIGHT}]"
+  fi
+  echo
+  echo "Downloading the video ($LABEL)..."
+  yt-dlp --cookies-from-browser "$BROWSER" --no-playlist --newline \
+    -f "$format" --merge-output-format mp4 \
+    -o "$DUB_WORKDIR/%(title)s [%(id)s].%(ext)s" "$URL" || return 1
+  for candidate in "$DUB_WORKDIR"/*.mp4; do
+    [ -f "$candidate" ] || continue
+    DUB_VIDEO="$candidate"
+    return 0
+  done
+  echo "The downloaded video could not be found."
+  return 1
+}
+
+prepare_local_dub_sources() {
+  local subtitle extension
+  if ! need_command osascript; then
+    echo "Choosing local files requires macOS Finder (osascript)."
+    return 1
+  fi
+  DUB_VIDEO="$(choose_finder_file "Choose the video to dub")" || return 1
+  subtitle="$(choose_finder_file "Choose the Chinese subtitle (SRT, VTT or ASS)")" || return 1
+  DUB_WORKDIR="$(mktemp -d "$OUTDIR/ytgrab-dub-work.XXXXXX")" || return 1
+
+  extension="$(printf '%s' "${subtitle##*.}" | tr '[:upper:]' '[:lower:]')"
+  case "$extension" in
+    srt) DUB_SUBTITLE="$subtitle" ;;
+    vtt|ass)
+      DUB_SUBTITLE="$DUB_WORKDIR/chinese.srt"
+      if ! ffmpeg -hide_banner -loglevel error -y -i "$subtitle" -map 0:s:0 -c:s srt "$DUB_SUBTITLE"; then
+        echo "The subtitle could not be converted to SRT."
+        return 1
+      fi
+      ;;
+    *) echo "Please choose an SRT, VTT or ASS subtitle."; return 1 ;;
+  esac
+}
+
+run_dub_workflow() {
+  local source_choice base output number status failure_choice
+
+  DUB_VOICE_DIR=""; DUB_VOICE_NAME=""; DUB_WORKDIR=""; DUB_VIDEO=""; DUB_SUBTITLE=""
+  check_dub_dependencies || return 1
+  choose_dub_voice || return 1
+
+  echo
+  echo "Choose source for the Chinese-dubbed video:"
+  echo "  1) Download video and captions from YouTube"
+  echo "  2) Use a local video and a Chinese subtitle file"
+  while true; do
+    read -r -p "Choose [1-2]: " source_choice || return 1
+    case "$source_choice" in 1|2) break ;; *) echo "Please choose 1 or 2." ;; esac
+  done
+
+  if [ "$source_choice" = "1" ]; then
+    prepare_youtube_dub_sources || return 1
+  else
+    prepare_local_dub_sources || return 1
+  fi
+
+  base="$(basename "$DUB_VIDEO")"
+  base="${base%.*}"
+  output="$OUTDIR/$base [zh-dub-$DUB_VOICE_NAME].mp4"
+  number=2
+  while [ -e "$output" ]; do
+    output="$OUTDIR/$base [zh-dub-$DUB_VOICE_NAME] ($number).mp4"
+    number=$((number + 1))
+  done
+
+  echo
+  echo "Video    : $DUB_VIDEO"
+  echo "Subtitle : $DUB_SUBTITLE"
+  echo "Voice    : $DUB_VOICE_NAME"
+  echo "Work dir : $DUB_WORKDIR"
+  echo "Long lectures take a while; finished lines are cached if you stop."
+  echo
+
+  while true; do
+    python3 "$SCRIPT_DIR/dub_chinese.py" \
+      --video "$DUB_VIDEO" \
+      --srt "$DUB_SUBTITLE" \
+      --voice "$DUB_VOICE_DIR" \
+      --output "$output" \
+      --workdir "$DUB_WORKDIR" \
+      --api-url "$(gpt_sovits_api_url)"
+    status=$?
+    [ "$status" -eq 0 ] && break
+    [ "$status" -eq 3 ] || return 1
+    echo
+    echo "  1) Retry/resume dubbing"
+    echo "  2) Stop and preserve the working files"
+    while true; do
+      read -r -p "Choose [1-2]: " failure_choice || return 1
+      case "$failure_choice" in
+        1) wait_for_gpt_sovits || return 1; break ;;
+        2) return 1 ;;
+        *) echo "Please choose 1 or 2." ;;
+      esac
+    done
+  done
+
+  FINAL_OUTPUT="$output"
+  cleanup_dub_workdir
+  return 0
+}
+
 # ---------- Main menu ----------
 main() {
   echo "========================================"
@@ -1613,18 +1885,21 @@ main() {
   echo "  3) MP3 audio"
   echo "  4) Subtitles   - SRT captions (official or auto-generated)"
   echo "  5) Dual subtitles burned into video"
+  echo "  6) Chinese-dubbed video - GPT-SoVITS voice, switchable original audio"
   echo
 
   while true; do
-    read -r -p "Type [1-5]: " TYPE
+    read -r -p "Type [1-6]: " TYPE
     case "$TYPE" in
-      1|2|3|4|5) break ;;
-      *) echo "Please choose 1, 2, 3, 4, or 5." ;;
+      1|2|3|4|5|6) break ;;
+      *) echo "Please choose 1, 2, 3, 4, 5, or 6." ;;
     esac
   done
 
   if [ "$TYPE" = "5" ]; then
     run_dual_subtitle_workflow; STATUS=$?
+  elif [ "$TYPE" = "6" ]; then
+    run_dub_workflow; STATUS=$?
   else
     run_standard_download "$TYPE"; STATUS=$?
   fi
@@ -1640,6 +1915,12 @@ main() {
         echo "OpenAI-improved $OPENAI_IMPROVED_LANGUAGE subtitle:"
         echo "  $IMPROVED_SUBTITLE_OUTPUT"
       fi
+    elif [ "$TYPE" = "6" ]; then
+      echo "Chinese-dubbed video finished!"
+      echo "Saved as:"
+      echo "  $FINAL_OUTPUT"
+      echo "Chinese audio plays by default; switch to the original track in"
+      echo "QuickTime (View > Languages) or VLC/Infuse on iPhone."
     else
       echo "Download finished!"
       echo "Saved to:"
@@ -1669,6 +1950,12 @@ main() {
       if [ -n "$IMPROVED_SUBTITLE_OUTPUT" ]; then
         echo "The improved subtitle was saved as:"
         echo "  $IMPROVED_SUBTITLE_OUTPUT"
+      fi
+    elif [ "$TYPE" = "6" ]; then
+      echo "Chinese dubbing failed or was stopped."
+      if [ -n "$DUB_WORKDIR" ] && [ -d "$DUB_WORKDIR" ]; then
+        echo "Working files (including finished lines) were preserved at:"
+        echo "  $DUB_WORKDIR"
       fi
     else
       if [ "$TYPE" = "4" ]; then

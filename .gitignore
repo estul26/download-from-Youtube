@@ -3,3 +3,7 @@
 !.env.example
 __pycache__/
 *.pyc
+
+# Voices picked with fetch_voices.py (keep them local)
+voices/*
+!voices/README.md
