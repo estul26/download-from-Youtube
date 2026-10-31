@@ -40,6 +40,7 @@ MERGE_MAX_GAP_MS = 700
 MERGE_MAX_SPAN_MS = 15_000
 MERGE_MAX_CHARS = 90
 MIN_GAP_MS = 80
+SAME_FAILURE_LIMIT = 3
 TAG_RE = re.compile(r"<[^>]+>|\{\\[^}]*\}")
 ANNOTATION_RE = re.compile(r"\[[^\]]*\]|【[^】]*】|♪+")
 SPEAKABLE_RE = re.compile(r"[\w一-鿿]")
@@ -365,31 +366,35 @@ def dub(args: argparse.Namespace) -> Path:
     clips_dir.mkdir(parents=True, exist_ok=True)
     normalized: list[Path | None] = []
     skipped = 0
+    failures: list[str] = []
     started = time.monotonic()
     done_new = 0
     print(f"Voice: {voice.name}  |  {len(segments)} lines  |  server {args.api_url}")
     for segment in segments:
         key = clip_key(segment.text, voice, args.seed, args.speed)
         final = clips_dir / f"{segment.index:05d}_{key}.wav"
-        rejected = clips_dir / f"{segment.index:05d}_{key}.rejected"
         label = f"[{segment.index + 1}/{len(segments)}]"
         if final.exists():
             normalized.append(final)
-            continue
-        if rejected.exists():
-            normalized.append(None)
-            skipped += 1
             continue
         try:
             data = synthesize(args.api_url, tts_payload(segment.text, voice, args.seed, args.speed))
         except ServerUnavailable:
             raise
         except DubError as exc:
+            # Rejections are not cached, so a rerun tries these lines again.
+            failures.append(str(exc))
+            if len(failures) >= SAME_FAILURE_LIMIT and len(set(failures[-SAME_FAILURE_LIMIT:])) == 1:
+                raise ServerUnavailable(
+                    f"GPT-SoVITS failed {SAME_FAILURE_LIMIT} lines in a row with the same error, "
+                    f"so the problem is probably the server, not the text:\n  {exc}\n"
+                    "Check the GPT-SoVITS window for details, fix it, restart the server and resume."
+                ) from exc
             print(f"{label} skipped: {exc}")
-            rejected.write_text(str(exc), encoding="utf-8")
             normalized.append(None)
             skipped += 1
             continue
+        failures.clear()
         raw = clips_dir / f"{segment.index:05d}_{key}.raw.wav"
         raw.write_bytes(data)
         normalize_clip(raw, final)

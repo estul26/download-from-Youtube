@@ -43,6 +43,7 @@ def tone_wav(seconds: float, rate: int = 32_000, lead_silence: float = 0.2) -> b
 class FakeTTSHandler(BaseHTTPRequestHandler):
     requests: list[dict] = []
     fail_text = "无法合成"
+    broken = False
 
     def log_message(self, *args) -> None:  # keep test output quiet
         pass
@@ -55,6 +56,11 @@ class FakeTTSHandler(BaseHTTPRequestHandler):
     def do_POST(self) -> None:
         payload = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
         FakeTTSHandler.requests.append(payload)
+        if FakeTTSHandler.broken:
+            self.send_response(400)
+            self.end_headers()
+            self.wfile.write(b'{"message": "tts failed", "Exception": "No module named resampy"}')
+            return
         if payload["text"] == self.fail_text:
             self.send_response(400)
             self.end_headers()
@@ -182,11 +188,37 @@ class EndToEndTests(unittest.TestCase):
             self.assertEqual(audio[1]["disposition"]["default"], 0)
             self.assertEqual(len(subtitles), 1)
 
-            # Second run with a new output reuses every cached line.
+            # Second run reuses every finished line and only retries the rejected one.
             FakeTTSHandler.requests = []
             arguments[arguments.index(str(output))] = str(directory / "again.mp4")
             self.assertEqual(dub_chinese.main(arguments), 0)
-            self.assertEqual(FakeTTSHandler.requests, [])
+            self.assertEqual([request["text"] for request in FakeTTSHandler.requests], ["无法合成"])
+
+    def test_stops_when_the_server_fails_every_line_and_resumes_later(self) -> None:
+        FakeTTSHandler.requests = []
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            video, srt, voice = self.make_inputs(directory)
+            more = "".join(
+                f"{n}\n00:00:0{n},000 --> 00:00:0{n},500\n第{n}句。\n\n" for n in range(1, 6)
+            )
+            srt.write_text(more, encoding="utf-8")
+            arguments = [
+                "--video", str(video), "--srt", str(srt), "--voice", str(voice),
+                "--output", str(directory / "out.mp4"), "--workdir", str(directory / "work"),
+                "--api-url", self.api_url,
+            ]
+            FakeTTSHandler.broken = True
+            try:
+                self.assertEqual(dub_chinese.main(arguments), 3)
+            finally:
+                FakeTTSHandler.broken = False
+            self.assertEqual(len(FakeTTSHandler.requests), 3)
+            self.assertFalse((directory / "out.mp4").exists())
+
+            FakeTTSHandler.requests = []
+            self.assertEqual(dub_chinese.main(arguments), 0)
+            self.assertEqual(len(FakeTTSHandler.requests), 5)
 
     def test_refuses_to_overwrite_and_reports_unreachable_server(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
