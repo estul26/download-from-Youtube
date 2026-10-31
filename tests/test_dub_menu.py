@@ -1,11 +1,16 @@
 from __future__ import annotations
 
 import os
+import shutil
 import socket
 import subprocess
 import tempfile
 import unittest
 from pathlib import Path
+
+import sys
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from test_transcribe import FAKE_FASTER_WHISPER  # noqa: E402
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 
@@ -139,6 +144,61 @@ class BackgroundChoiceTests(unittest.TestCase):
         self.assertIn("Demucs is not installed", output)
         self.assertIn("Continuing with voice only.", output)
         self.assertIn("keep=0", output)
+
+
+FAKE_IMPROVER = """
+import sys
+from pathlib import Path
+args = sys.argv[1:]
+reference = Path(args[args.index("--reference") + 1]).read_text(encoding="utf-8")
+Path(args[args.index("--output") + 1]).write_text(reference.replace("Hello everyone.", "大家好。"), encoding="utf-8")
+"""
+
+
+class TranscriptionFlowTests(unittest.TestCase):
+    def test_transcribes_then_translates_a_local_video(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            app = directory / "app"
+            app.mkdir()
+            shutil.copy(REPOSITORY_ROOT / "transcribe.py", app / "transcribe.py")
+            (app / "subtitle_improver.py").write_text(FAKE_IMPROVER, encoding="utf-8")
+            modules = directory / "modules"
+            modules.mkdir()
+            (modules / "faster_whisper.py").write_text(FAKE_FASTER_WHISPER, encoding="utf-8")
+            video = directory / "Lecture One.mp4"
+            subprocess.run(
+                ["ffmpeg", "-loglevel", "error", "-y", "-f", "lavfi", "-i", "sine=duration=5", str(video)], check=True
+            )
+            (directory / "home").mkdir()
+            environment = dict(
+                os.environ,
+                HOME=str(directory / "home"),
+                PYTHONPATH=str(modules),
+                GPT_SOVITS_PYTHON=subprocess.check_output(["which", "python3"], text=True).strip(),
+            )
+            result = subprocess.run(
+                ["bash", "-c",
+                 f'source "{REPOSITORY_ROOT}/ytgrab.sh"; SCRIPT_DIR="{app}"; OPENAI_RUNTIME_API_KEY=test;'
+                 f' DUB_WORKDIR="$(mktemp -d)"; DUB_VIDEO="{video}"; transcribe_and_translate_dub_video;'
+                 ' echo "status=$?"; echo "EN=$DUB_ENGLISH_SUBTITLE"; echo "ZH=$DUB_SUBTITLE"; cat "$DUB_SUBTITLE"'],
+                env=environment, text=True, capture_output=True, check=False,
+            )
+            self.assertIn("status=0", result.stdout, result.stderr)
+            self.assertIn("EN=" + str(directory / "home/Downloads/YouTube/Lecture One [Whisper].en.srt"), result.stdout)
+            self.assertIn("Lecture One [Whisper] [OpenAI-translated-zh-Hans].srt", result.stdout)
+            self.assertIn("大家好。", result.stdout)
+
+    def test_declining_transcription_returns_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            (Path(temporary) / "home").mkdir()
+            result = subprocess.run(
+                ["bash", "-c", f'source "{REPOSITORY_ROOT}/ytgrab.sh"; offer_whisper_transcription; echo "status=$?"'],
+                env=dict(os.environ, HOME=str(Path(temporary) / "home")), input="n\n",
+                text=True, capture_output=True, check=False,
+            )
+            self.assertIn("no usable captions", result.stdout)
+            self.assertIn("status=1", result.stdout)
 
 
 class AutoStartTests(unittest.TestCase):

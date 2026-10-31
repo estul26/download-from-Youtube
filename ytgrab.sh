@@ -29,6 +29,7 @@ DUB_WORKDIR=""
 DUB_VIDEO=""
 DUB_SUBTITLE=""
 DUB_ENGLISH_SUBTITLE=""
+WHISPER_PYTHON=""
 ENGLISH_SUBTITLE_OUTPUT=""
 GPT_SOVITS_PID=""
 DUB_KEEP_BACKGROUND=0
@@ -1876,8 +1877,88 @@ download_youtube_chinese_subtitle() {
   return 1
 }
 
+# faster-whisper ships with GPT-SoVITS, so its Python is used for transcription.
+ensure_whisper_python() {
+  local python
+  WHISPER_PYTHON=""
+  python="$(locate_gpt_sovits_python)" || {
+    echo "Transcription uses the GPT-SoVITS Python environment, which was not found."
+    return 1
+  }
+  if ! "$python" -c "import faster_whisper" >/dev/null 2>&1; then
+    echo
+    echo "faster-whisper is not installed in the GPT-SoVITS environment ($python)."
+    ask_yes_no "Install it now with pip?" "yes" || return 1
+    "$python" -m pip install faster-whisper || return 1
+  fi
+  WHISPER_PYTHON="$python"
+}
+
+# Transcribe the English speech of $1 into an SRT saved in OUTDIR.
+transcribe_video_to_english_srt() {
+  local video="$1" base
+  ensure_whisper_python || return 1
+  base="$(basename "$video")"
+  base="${base%.*}"
+  make_unique_srt_path "$OUTDIR/$base [Whisper].en.srt"
+  echo
+  echo "Transcribing the English speech locally with Whisper (free and offline;"
+  echo "the first run downloads the model, about 1.6 GB)..."
+  "$WHISPER_PYTHON" "$SCRIPT_DIR/transcribe.py" --video "$video" --output "$UNIQUE_SRT_PATH" || return 1
+  ENGLISH_SUBTITLE_OUTPUT="$UNIQUE_SRT_PATH"
+}
+
+# Translate an English SRT file with OpenAI into OUTDIR. Uses the key chosen in
+# configure_openai_subtitle_use and resumes from checkpoints on retry.
+translate_srt_with_openai() {
+  local source="$1" target="$2" base safe_code partial model failure_choice
+  base="$(basename "$source")"
+  base="${base%.srt}"
+  base="${base%.en}"
+  safe_code="$(printf '%s' "$target" | sed 's/[^A-Za-z0-9_-]/-/g')"
+  partial="$DUB_WORKDIR/openai-translated.srt"
+  model="${OPENAI_SUBTITLE_MODEL:-gpt-6-luna}"
+  echo
+  echo "Translating the English subtitle into $target with OpenAI ($model)..."
+  while ! OPENAI_API_KEY="$OPENAI_RUNTIME_API_KEY" \
+      python3 "$SCRIPT_DIR/subtitle_improver.py" \
+      --mode translate --reference "$source" --output "$partial" \
+      --language "$target" --model "$model"; do
+    echo
+    echo "Completed API chunks were checkpointed and can be resumed."
+    echo "  1) Retry/resume OpenAI translation"
+    echo "  2) Stop and preserve the working files"
+    while true; do
+      read -r -p "Choose [1-2]: " failure_choice || return 1
+      case "$failure_choice" in
+        1) break ;;
+        2) return 1 ;;
+        *) echo "Please choose 1 or 2." ;;
+      esac
+    done
+  done
+  make_unique_srt_path "$OUTDIR/$base [OpenAI-translated-$safe_code].srt"
+  mv -- "$partial" "$UNIQUE_SRT_PATH" || return 1
+  TRANSLATED_SUBTITLE_OUTPUT="$UNIQUE_SRT_PATH"
+  echo "Translated SRT: $TRANSLATED_SUBTITLE_OUTPUT"
+}
+
+offer_whisper_transcription() {
+  echo
+  echo "This video has no usable captions."
+  ask_yes_no "Transcribe the English speech with Whisper (local, free) and translate it with OpenAI?" "yes" || return 1
+  if [ "$OPENAI_SUBTITLE_ENABLED" -ne 1 ]; then
+    configure_openai_subtitle_use "translate" "Simplified Chinese (zh-Hans)"
+    if [ "$OPENAI_SUBTITLE_ENABLED" -ne 1 ]; then
+      echo "Translation needs OpenAI, so transcription was not started."
+      return 1
+    fi
+  fi
+  return 0
+}
+
 prepare_youtube_dub_sources() {
-  local subtitle_choice format candidate status
+  local subtitle_choice format candidate status need_transcription=0
 
   prompt_url
   echo
@@ -1905,18 +1986,23 @@ prepare_youtube_dub_sources() {
     if [ "$status" -eq 0 ]; then
       DUB_SUBTITLE="$TRANSLATED_SUBTITLE_OUTPUT"
       DUB_ENGLISH_SUBTITLE="$ENGLISH_SUBTITLE_OUTPUT"
+    elif [ "$status" -eq 1 ] && [ -z "$ENGLISH_SUBTITLE_OUTPUT" ] && offer_whisper_transcription; then
+      need_transcription=1
     elif [ "$status" -eq 1 ]; then
       download_youtube_chinese_subtitle || return 1
     else
       return 1
     fi
-  else
-    download_youtube_chinese_subtitle || return 1
+  elif download_youtube_chinese_subtitle; then
     if download_english_subtitle_for_translation "$DUB_WORKDIR"; then
       DUB_ENGLISH_SUBTITLE="$ENGLISH_SUBTITLE_FILE"
     else
       echo "No English captions were found; only the Chinese subtitle will be added."
     fi
+  elif offer_whisper_transcription; then
+    need_transcription=1
+  else
+    return 1
   fi
 
   if [ -z "$HEIGHT" ]; then
@@ -1932,10 +2018,37 @@ prepare_youtube_dub_sources() {
   for candidate in "$DUB_WORKDIR"/*.mp4; do
     [ -f "$candidate" ] || continue
     DUB_VIDEO="$candidate"
-    return 0
   done
-  echo "The downloaded video could not be found."
-  return 1
+  if [ -z "$DUB_VIDEO" ]; then
+    echo "The downloaded video could not be found."
+    return 1
+  fi
+  [ "$need_transcription" -eq 1 ] || return 0
+  transcribe_and_translate_dub_video
+}
+
+transcribe_and_translate_dub_video() {
+  ENGLISH_SUBTITLE_OUTPUT=""
+  TRANSLATED_SUBTITLE_OUTPUT=""
+  transcribe_video_to_english_srt "$DUB_VIDEO" || return 1
+  translate_srt_with_openai "$ENGLISH_SUBTITLE_OUTPUT" "zh-Hans" || return 1
+  DUB_ENGLISH_SUBTITLE="$ENGLISH_SUBTITLE_OUTPUT"
+  DUB_SUBTITLE="$TRANSLATED_SUBTITLE_OUTPUT"
+}
+
+prepare_local_untitled_dub_sources() {
+  if ! need_command osascript; then
+    echo "Choosing local files requires macOS Finder (osascript)."
+    return 1
+  fi
+  DUB_VIDEO="$(choose_finder_file "Choose the English video to dub")" || return 1
+  configure_openai_subtitle_use "translate" "Simplified Chinese (zh-Hans)"
+  if [ "$OPENAI_SUBTITLE_ENABLED" -ne 1 ]; then
+    echo "Translation needs OpenAI, so this source cannot be used without it."
+    return 1
+  fi
+  DUB_WORKDIR="$(mktemp -d "$OUTDIR/ytgrab-dub-work.XXXXXX")" || return 1
+  transcribe_and_translate_dub_video
 }
 
 # Print an SRT path for a local subtitle, converting VTT or ASS into the work dir.
@@ -1987,16 +2100,17 @@ run_dub_workflow() {
   echo "Choose source for the Chinese-dubbed video:"
   echo "  1) Download video and captions from YouTube"
   echo "  2) Use a local video and a Chinese subtitle file"
+  echo "  3) Use a local English video without subtitles (Whisper + OpenAI)"
   while true; do
-    read -r -p "Choose [1-2]: " source_choice || return 1
-    case "$source_choice" in 1|2) break ;; *) echo "Please choose 1 or 2." ;; esac
+    read -r -p "Choose [1-3]: " source_choice || return 1
+    case "$source_choice" in 1|2|3) break ;; *) echo "Please choose 1, 2, or 3." ;; esac
   done
 
-  if [ "$source_choice" = "1" ]; then
-    prepare_youtube_dub_sources || return 1
-  else
-    prepare_local_dub_sources || return 1
-  fi
+  case "$source_choice" in
+    1) prepare_youtube_dub_sources || return 1 ;;
+    2) prepare_local_dub_sources || return 1 ;;
+    3) prepare_local_untitled_dub_sources || return 1 ;;
+  esac
 
   base="$(basename "$DUB_VIDEO")"
   base="${base%.*}"
